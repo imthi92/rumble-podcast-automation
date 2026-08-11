@@ -27,13 +27,17 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           playwright install chromium
-          playwright install-deps chromium
+          sudo playwright install-deps chromium
 
-      - name: Generate episode video
+      - name: Generate episode video (rotating scripts)
         run: |
           mkdir -p output
-          SCRIPT=$(ls scripts/*.txt | head -1)
-          python generate_video.py "$SCRIPT" || python generate_video.py scripts/episode_01_pilot.txt
+          SCRIPTS=$(ls scripts/*.txt)
+          COUNT=$(echo "$SCRIPTS" | wc -l)
+          INDEX=$(( ( $(date +%j) % COUNT ) ))
+          SCRIPT=$(echo "$SCRIPTS" | sed -n "$((INDEX + 1))p")
+          echo "Selected script: $SCRIPT"
+          python generate_video.py "$SCRIPT"
 
       - name: Upload to Rumble
         env:

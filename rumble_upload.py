@@ -19,7 +19,6 @@ If Rumble changes their site, update SELECTORS below (run with --headed to debug
 """
 
 import argparse
-import base64
 import json
 import os
 import sys
@@ -43,6 +42,7 @@ SELECTORS = {
     "upload_tags": ["input[name=tags]", "#tags", "input[placeholder*=tags]", "input[placeholder*=Tags]"],
     "upload_publish": ["button[type=submit]", "button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')"],
     "visibility_public": ["input[value=public]", "label:has-text('Public')", "input[name=visibility][value=public]"],
+    "thumbnail_file": ["input[type=file][accept*=image]", ".thumbnail-upload input", "input[name=thumbnail]"],
 }
 
 DEFAULT_DESCRIPTION = """Cat Podcast with Simba and Meow - fully AI generated.
@@ -115,13 +115,13 @@ def try_fill(page, selectors, value, timeout=15000, description="field"):
 def is_logged_in(page):
     """Heuristic: upload page should show upload UI, not a login form."""
     try:
-        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
-    # Look for the file upload control
+    # Look for the file upload control (may be hidden -> check "attached")
     for sel in SELECTORS["upload_file"]:
         try:
-            page.locator(sel).first.wait_for(state="visible", timeout=5000)
+            page.locator(sel).first.wait_for(state="attached", timeout=5000)
             return True
         except Exception:
             continue
@@ -152,9 +152,9 @@ def login_with_credentials(page, email, password):
         _screenshot(page, "rumble_debug_login")
         return False
 
-    # Wait for redirect away from login
+    # Wait for redirect AWAY from the login page
     try:
-        page.wait_for_url("**rumble.com/**", timeout=30000)
+        page.wait_for_url(lambda url: "/login" not in url, timeout=30000)
     except Exception:
         pass
     time.sleep(3)
@@ -166,6 +166,31 @@ def login_with_credentials(page, email, password):
 
     print("    Login successful.")
     return True
+
+
+def _set_thumbnail(page, thumbnail_path):
+    """Set thumbnail only if a dedicated thumbnail file input exists.
+    Never touches the video file input (first input[type=file] on the page)."""
+    try:
+        file_inputs = page.locator("input[type=file]")
+        count = file_inputs.count()
+        if count <= 1:
+            print("  ! No separate thumbnail field found, skipping thumbnail.")
+            return
+        # Use a dedicated image-accepting input if present
+        for sel in SELECTORS["thumbnail_file"]:
+            try:
+                page.locator(sel).first.wait_for(state="attached", timeout=3000)
+                page.locator(sel).first.set_input_files(thumbnail_path)
+                print("  Thumbnail set.")
+                return
+            except Exception:
+                continue
+        # Fallback: last file input is probably the thumbnail
+        file_inputs.nth(count - 1).set_input_files(thumbnail_path)
+        print("  Thumbnail set (last file input).")
+    except Exception as e:
+        print(f"  ! Thumbnail upload skipped: {e}")
 
 
 def upload_video(video_path, title, description=None, tags=None, thumbnail_path=None, headed=False):
@@ -183,116 +208,115 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
     session = load_session()
 
     pw = get_playwright()
-    browser = pw.chromium.launch(headless=not headed)
-    context = browser.new_context(storage_state=session) if session else browser.new_context()
-    page = context.new_page()
-
+    pw.start()
     try:
-        # --- Ensure logged in ---
-        page.goto(UPLOAD_URL, wait_until="domcontentloaded")
-        time.sleep(2)
+        browser = pw.chromium.launch(headless=not headed)
+        context = browser.new_context(storage_state=session) if session else browser.new_context()
+        page = context.new_page()
 
-        if not is_logged_in(page):
-            print("  No valid session, logging in...")
-            if not (email and password):
-                print("  ERROR: No saved session and no RUMBLE_EMAIL/RUMBLE_PASSWORD set.")
-                print("  Run once: python rumble_upload.py --login")
-                print("  Or set env vars for cloud automation.")
-                return None
-            if not login_with_credentials(page, email, password):
-                return None
-            save_session(context.storage_state())
-
-        # --- Go to upload page ---
-        page.goto(UPLOAD_URL, wait_until="domcontentloaded")
-        time.sleep(3)
-
-        # --- Select file ---
-        print(f"  Uploading file: {os.path.basename(video_path)}")
-        file_uploaded = False
-        for sel in SELECTORS["upload_file"]:
-            try:
-                page.locator(sel).first.wait_for(state="attached", timeout=15000)
-                page.locator(sel).first.set_input_files(video_path)
-                file_uploaded = True
-                break
-            except Exception:
-                continue
-        if not file_uploaded:
-            print("  ERROR: file input not found.")
-            _screenshot(page, "rumble_debug_upload")
-            return None
-
-        # Wait for the file to process and the form to appear
-        print("  Waiting for upload form...")
-        time.sleep(8)
         try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
+            # --- Ensure logged in ---
+            page.goto(UPLOAD_URL, wait_until="domcontentloaded")
+            time.sleep(2)
 
-        # --- Fill title ---
-        if not try_fill(page, SELECTORS["upload_title"], title[:200], description="title"):
-            print("  ! Title field not found - trying to continue.")
+            if not is_logged_in(page):
+                print("  No valid session, logging in...")
+                if not (email and password):
+                    print("  ERROR: No saved session and no RUMBLE_EMAIL/RUMBLE_PASSWORD set.")
+                    print("  Run once: python rumble_upload.py --login")
+                    print("  Or set env vars for cloud automation.")
+                    return None
+                if not login_with_credentials(page, email, password):
+                    return None
+                save_session(context.storage_state())
 
-        # --- Fill description ---
-        if description:
-            if not try_fill(page, SELECTORS["upload_description"], description, description="description"):
-                print("  ! Description field not found - trying to continue.")
-
-        # --- Fill tags ---
-        if tags:
-            if not try_fill(page, SELECTORS["upload_tags"], tags, description="tags"):
-                print("  ! Tags field not found - trying to continue.")
-
-        # --- Set visibility to public ---
-        try_click(page, SELECTORS["visibility_public"], timeout=8000, description="public visibility")
-
-        # --- Upload thumbnail (optional) ---
-        if thumbnail_path and os.path.exists(thumbnail_path):
-            try:
-                page.set_input_files("input[type=file]", thumbnail_path)
-                print("  Thumbnail set.")
-            except Exception:
-                print("  ! Thumbnail upload skipped.")
-
-        # --- Publish ---
-        _screenshot(page, "rumble_before_publish")
-        if try_click(page, SELECTORS["upload_publish"], timeout=10000, description="publish button"):
-            print("  Publish clicked - waiting for processing...")
-            time.sleep(5)
-            try:
-                page.wait_for_load_state("networkidle", timeout=45000)
-            except Exception:
-                pass
+            # --- Go to upload page ---
+            page.goto(UPLOAD_URL, wait_until="domcontentloaded")
             time.sleep(3)
 
-            # Wait for the success/redirect
+            # --- Select file ---
+            print(f"  Uploading file: {os.path.basename(video_path)}")
+            file_uploaded = False
+            for sel in SELECTORS["upload_file"]:
+                try:
+                    page.locator(sel).first.wait_for(state="attached", timeout=15000)
+                    page.locator(sel).first.set_input_files(video_path)
+                    file_uploaded = True
+                    break
+                except Exception:
+                    continue
+            if not file_uploaded:
+                print("  ERROR: file input not found.")
+                _screenshot(page, "rumble_debug_upload")
+                return None
+
+            # Wait for the file to process and the form to appear
+            print("  Waiting for upload form...")
+            time.sleep(8)
             try:
-                page.wait_for_url("**/video/*", timeout=45000)
+                page.wait_for_load_state("networkidle", timeout=30000)
             except Exception:
                 pass
 
+            # --- Fill title ---
+            if not try_fill(page, SELECTORS["upload_title"], title[:200], description="title"):
+                print("  ! Title field not found - trying to continue.")
+
+            # --- Fill description ---
+            if description:
+                if not try_fill(page, SELECTORS["upload_description"], description, description="description"):
+                    print("  ! Description field not found - trying to continue.")
+
+            # --- Fill tags ---
+            if tags:
+                if not try_fill(page, SELECTORS["upload_tags"], tags, description="tags"):
+                    print("  ! Tags field not found - trying to continue.")
+
+            # --- Set visibility to public ---
+            try_click(page, SELECTORS["visibility_public"], timeout=8000, description="public visibility")
+
+            # --- Upload thumbnail (optional, guarded) ---
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                _set_thumbnail(page, thumbnail_path)
+
+            # --- Publish ---
+            _screenshot(page, "rumble_before_publish")
+            if try_click(page, SELECTORS["upload_publish"], timeout=10000, description="publish button"):
+                print("  Publish clicked - waiting for processing...")
+                time.sleep(5)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=45000)
+                except Exception:
+                    pass
+                time.sleep(3)
+
+                # Wait for redirect to the video page
+                try:
+                    page.wait_for_url(lambda url: "/video/" in url, timeout=45000)
+                except Exception:
+                    pass
+
+                url = page.url
+                if url and "/video/" in url:
+                    _screenshot(page, "rumble_after_publish")
+                    print("  Upload confirmed. URL:", url)
+                    return url
+
+            # If we got here, we can't confirm success
             _screenshot(page, "rumble_after_publish")
-            print("  Upload submitted successfully.")
+            for marker in ["Video uploaded", "upload successful", "successfully", "has been uploaded"]:
+                if page.locator(f"text={marker}").count() > 0:
+                    print(f"  Success marker found: {marker}")
+                    return page.url or None
 
-            url = page.url
-            if url and url != UPLOAD_URL:
-                return url
+            print("  WARNING: Could not confirm success. Check rumble_after_publish.png")
+            return None
 
-        # If we got here without returning, check for success message
-        _screenshot(page, "rumble_after_publish")
-        for marker in ["Video uploaded", "upload successful", "successfully", "has been uploaded"]:
-            if page.locator(f"text={marker}").count() > 0:
-                print(f"  Success marker found: {marker}")
-                return page.url
-
-        print("  WARNING: Could not confirm success. Check rumble_after_publish.png")
-        return page.url or None
-
+        finally:
+            context.close()
+            browser.close()
     finally:
-        context.close()
-        browser.close()
+        pw.stop()
 
 
 def _screenshot(page, name):
@@ -314,28 +338,47 @@ def interactive_login():
     print("=" * 60)
 
     pw = get_playwright()
-    browser = pw.chromium.launch(headless=False)
-    context = browser.new_context()
-    page = context.new_page()
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-    print("\nWaiting for you to log in... (browser is open)")
-    print("You have 5 minutes. Close the browser window when done.")
-
-    # Wait until user closes the browser
+    pw.start()
     try:
-        page.wait_for_event("close", timeout=300000)
-    except Exception:
-        print("Timeout waiting for login. Saving whatever session we have.")
+        browser = pw.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-    try:
-        save_session(context.storage_state())
-        print("Session saved. Uploads are now fully automatic.")
-    except Exception as e:
-        print(f"Could not save session: {e}")
+        print("\nWaiting for you to log in... (browser is open)")
+        print("You have 5 minutes. Close the browser window when done.")
 
-    context.close()
-    browser.close()
+        # Wait until user closes the browser or navigates away from /login
+        deadline = time.time() + 300
+        logged_in = False
+        while time.time() < deadline:
+            try:
+                if "/login" not in page.url:
+                    logged_in = True
+                    print("  Login detected!")
+                    break
+            except Exception:
+                pass
+            try:
+                page.wait_for_event("close", timeout=2000)
+                print("  Browser closed.")
+                break
+            except Exception:
+                continue
+
+        if not logged_in:
+            print("  Note: could not confirm login. Saving whatever session exists.")
+
+        try:
+            save_session(context.storage_state())
+            print("Session saved. Uploads are now fully automatic.")
+        except Exception as e:
+            print(f"Could not save session: {e}")
+
+        context.close()
+        browser.close()
+    finally:
+        pw.stop()
 
 
 def build_description(episode_title):

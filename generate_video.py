@@ -13,8 +13,6 @@ import os
 import sys
 import asyncio
 import json
-import shutil
-import tempfile
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -22,6 +20,8 @@ from datetime import datetime
 VOICE_SPEAKER1 = "en-US-ChristopherNeural"  # Simba
 VOICE_SPEAKER2 = "en-US-JennyNeural"        # Meow
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
+SRT_TIME = "{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def ensure_dir(path):
@@ -44,10 +44,20 @@ def parse_script(script_path):
     return lines
 
 
-async def synth_segment(text, voice, out_path):
+async def _synth_all(lines, voice1, voice2, seg_dir):
+    """Synthesize all segments using a single event loop."""
     import edge_tts
-    communicate = edge_tts.Communicate(text, voice, rate="-8%")
-    await communicate.save(out_path)
+
+    paths = []
+    tasks = []
+    for i, (speaker, text) in enumerate(lines):
+        voice = voice1 if "1" in speaker else voice2
+        out = os.path.join(seg_dir, f"seg_{i:04d}.mp3")
+        communicate = edge_tts.Communicate(text, voice, rate="-8%")
+        tasks.append(communicate.save(out))
+        paths.append(out)
+    await asyncio.gather(*tasks)
+    return paths
 
 
 def get_audio_duration(path):
@@ -63,6 +73,14 @@ def get_audio_duration(path):
         return 30
 
 
+def fmt_srt(seconds):
+    ms = int(seconds * 1000)
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def make_srt(lines, seg_durations, out_path):
     """Build SRT from segments."""
     entries = []
@@ -70,16 +88,29 @@ def make_srt(lines, seg_durations, out_path):
     for i, ((speaker, text), dur) in enumerate(zip(lines, seg_durations)):
         start, end = t, t + dur
         t = end + 0.3
-        s = f"{int(start//3600):02d}:{int(start%3600//60):02d}:{int(start%60):02d},{int(start%1*1000):03d}"
-        e = f"{int(end//3600):02d}:{int(end%3600//60):02d}:{int(end%60):02d},{int(end%1*1000):03d}"
-        entries.append(f"{i+1}\n{s} --> {e}\n{text}\n")
+        entries.append(f"{i+1}\n{fmt_srt(start)} --> {fmt_srt(end)}\n{text}\n")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(entries))
 
 
+def ffmpeg_filter_escape(path):
+    """Escape a path for use inside an ffmpeg filter (subtitles=)."""
+    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def escape_drawtext(text):
+    """Escape text for ffmpeg drawtext (commas, colons, quotes)."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("'", "\\\\'")
+        .replace(":", "\\:")
+        .replace(",", "\\,")
+    )
+
+
 def make_thumbnail(title, out_path):
     """Simple thumbnail with ffmpeg."""
-    safe_title = title[:40].replace("'", "").replace('"', "").replace(":", "")
+    safe_title = escape_drawtext(title[:40])
     try:
         cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=#1a1a2e:s=1280x720:d=1",
@@ -89,10 +120,21 @@ def make_thumbnail(title, out_path):
             ),
             "-frames:v", "1", out_path,
         ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception:
-        pass
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print(f"  ! Thumbnail ffmpeg stderr: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"  ! Thumbnail generation failed: {e}")
     return out_path if os.path.exists(out_path) else None
+
+
+def run_ffmpeg(cmd, timeout=600):
+    """Run ffmpeg and return True on success."""
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        print(f"  ! ffmpeg stderr: {result.stderr[-500:]}")
+        return False
+    return True
 
 
 def main(script_path, episode_title=None):
@@ -112,45 +154,54 @@ def main(script_path, episode_title=None):
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = ensure_dir(os.path.join(OUTPUT_DIR, f"episode_{ts}"))
-
-    # 1. Synthesize per-segment audio
     seg_dir = ensure_dir(os.path.join(out_dir, "segments"))
-    seg_paths = []
-    print("Synthesizing audio...")
-    for i, (speaker, text) in enumerate(lines):
-        voice = VOICE_SPEAKER1 if "1" in speaker else VOICE_SPEAKER2
-        seg = os.path.join(seg_dir, f"seg_{i:04d}.mp3")
-        asyncio.run(synth_segment(text, voice, seg))
-        seg_paths.append(seg)
 
-    # 2. Concatenate
+    # 1. Synthesize all segments in one event loop
+    print("Synthesizing audio...")
+    try:
+        seg_paths = asyncio.run(_synth_all(lines, VOICE_SPEAKER1, VOICE_SPEAKER2, seg_dir))
+    except Exception as e:
+        print(f"ERROR: audio synthesis failed: {e}")
+        sys.exit(1)
+
+    for p in seg_paths:
+        if not os.path.exists(p):
+            print(f"ERROR: missing segment {p}")
+            sys.exit(1)
+
+    # 2. Concatenate (use forward slashes for the concat list)
     concat = os.path.join(seg_dir, "concat.txt")
     with open(concat, "w", encoding="utf-8") as f:
         for p in seg_paths:
-            f.write(f"file '{p}'\n")
+            f.write(f"file '{p.replace(os.sep, '/')}'\n")
     raw_audio = os.path.join(out_dir, "raw_audio.mp3")
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
-                    "-c:a", "libmp3lame", raw_audio], capture_output=True, text=True, timeout=300)
+    if not run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
+                       "-c:a", "libmp3lame", raw_audio], timeout=300):
+        print("ERROR: audio concat failed")
+        sys.exit(1)
 
     # 3. Subtitles
     durations = [get_audio_duration(p) for p in seg_paths]
     srt_path = os.path.join(out_dir, "subtitles.srt")
     make_srt(lines, durations, srt_path)
 
-    # 4. Build video (Ken Burns over color bg)
+    # 4. Build video
     total_dur = sum(durations) + 0.3 * (len(durations) - 1)
     video_path = os.path.join(out_dir, "final_video.mp4")
+    srt_filter = ffmpeg_filter_escape(srt_path)
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c=#1a1a2e:s=1280x720:d={total_dur}",
         "-i", raw_audio,
-        "-vf", f"subtitles={srt_path}:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
+        "-vf", f"subtitles={srt_filter}:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
         "-c:v", "libx264", "-preset", "fast",
         "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
         "-shortest", video_path,
     ]
     print("Building video...")
-    subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if not run_ffmpeg(cmd, timeout=600):
+        print("ERROR: video generation failed")
+        sys.exit(1)
 
     # 5. Thumbnail
     thumb_path = make_thumbnail(episode_title, os.path.join(out_dir, "thumbnail.png"))
