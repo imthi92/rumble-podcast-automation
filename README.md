@@ -80,6 +80,6 @@ The workflow picks the first script alphabetically.
 
 ## Troubleshooting
 
-- **Login fails / captcha**: Run `--login` locally once and commit the session, or use `--headed` to see the issue.
+- **Login fails / captcha**: Run `--login` locally once to create `rumble_session.json`, then set `RUMBLE_EMAIL`/`RUMBLE_PASSWORD` for CI. Use `--headed` locally to see what's happening.
 - **Upload page changed**: Rumble has no public API, so if they change their UI, update the `SELECTORS` dict at the top of `rumble_upload.py`.
 - **Video generation fails**: ensure `ffmpeg` is installed (`ffmpeg -version`).

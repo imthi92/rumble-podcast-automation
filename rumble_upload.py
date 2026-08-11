@@ -208,9 +208,9 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
     session = load_session()
 
     pw = get_playwright()
-    pw.start()
+    playwright = pw.start()
     try:
-        browser = pw.chromium.launch(headless=not headed)
+        browser = playwright.chromium.launch(headless=not headed)
         context = browser.new_context(storage_state=session) if session else browser.new_context()
         page = context.new_page()
 
@@ -338,9 +338,9 @@ def interactive_login():
     print("=" * 60)
 
     pw = get_playwright()
-    pw.start()
+    playwright = pw.start()
     try:
-        browser = pw.chromium.launch(headless=False)
+        browser = playwright.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
