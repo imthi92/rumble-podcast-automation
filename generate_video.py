@@ -21,7 +21,8 @@ VOICE_SPEAKER1 = "en-US-ChristopherNeural"  # Simba
 VOICE_SPEAKER2 = "en-US-JennyNeural"        # Meow
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
-SRT_TIME = "{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+TTS_CONCURRENCY = 5
+TTS_MAX_RETRIES = 3
 
 
 def ensure_dir(path):
@@ -44,17 +45,33 @@ def parse_script(script_path):
     return lines
 
 
-async def _synth_all(lines, voice1, voice2, seg_dir):
-    """Synthesize all segments using a single event loop."""
+async def _synth_one(text, voice, out, sem, attempts=TTS_MAX_RETRIES):
+    """Synthesize a single segment with retries, respecting the concurrency limit."""
     import edge_tts
 
-    paths = []
+    for attempt in range(1, attempts + 1):
+        try:
+            async with sem:
+                communicate = edge_tts.Communicate(text, voice, rate="-8%")
+                await communicate.save(out)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                return
+            print(f"  ! empty audio for {os.path.basename(out)} (attempt {attempt})")
+        except Exception as e:
+            print(f"  ! TTS failed for {os.path.basename(out)} (attempt {attempt}): {e}")
+        await asyncio.sleep(2 * attempt)
+    raise RuntimeError(f"Could not synthesize {os.path.basename(out)} after {attempts} attempts")
+
+
+async def _synth_all(lines, voice1, voice2, seg_dir):
+    """Synthesize all segments concurrently with a bounded semaphore."""
+    sem = asyncio.Semaphore(TTS_CONCURRENCY)
     tasks = []
+    paths = []
     for i, (speaker, text) in enumerate(lines):
         voice = voice1 if "1" in speaker else voice2
         out = os.path.join(seg_dir, f"seg_{i:04d}.mp3")
-        communicate = edge_tts.Communicate(text, voice, rate="-8%")
-        tasks.append(communicate.save(out))
+        tasks.append(_synth_one(text, voice, out, sem))
         paths.append(out)
     await asyncio.gather(*tasks)
     return paths
@@ -82,12 +99,12 @@ def fmt_srt(seconds):
 
 
 def make_srt(lines, seg_durations, out_path):
-    """Build SRT from segments."""
+    """Build SRT from segments (back-to-back, matching the concatenated audio exactly)."""
     entries = []
     t = 0.0
     for i, ((speaker, text), dur) in enumerate(zip(lines, seg_durations)):
         start, end = t, t + dur
-        t = end + 0.3
+        t = end
         entries.append(f"{i+1}\n{fmt_srt(start)} --> {fmt_srt(end)}\n{text}\n")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(entries))
@@ -98,19 +115,14 @@ def ffmpeg_filter_escape(path):
     return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
 
 
-def escape_drawtext(text):
-    """Escape text for ffmpeg drawtext (commas, colons, quotes)."""
-    return (
-        text.replace("\\", "\\\\")
-        .replace("'", "\\\\'")
-        .replace(":", "\\:")
-        .replace(",", "\\,")
-    )
+def sanitize_drawtext(text):
+    """Remove characters that break ffmpeg drawtext filters."""
+    return "".join(c for c in text if c.isalnum() or c in " _-").strip() or "Untitled"
 
 
 def make_thumbnail(title, out_path):
     """Simple thumbnail with ffmpeg."""
-    safe_title = escape_drawtext(title[:40])
+    safe_title = sanitize_drawtext(title[:40])
     try:
         cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=#1a1a2e:s=1280x720:d=1",
@@ -185,8 +197,8 @@ def main(script_path, episode_title=None):
     srt_path = os.path.join(out_dir, "subtitles.srt")
     make_srt(lines, durations, srt_path)
 
-    # 4. Build video
-    total_dur = sum(durations) + 0.3 * (len(durations) - 1)
+    # 4. Build video (duration from the actual concatenated audio)
+    total_dur = get_audio_duration(raw_audio)
     video_path = os.path.join(out_dir, "final_video.mp4")
     srt_filter = ffmpeg_filter_escape(srt_path)
     cmd = [

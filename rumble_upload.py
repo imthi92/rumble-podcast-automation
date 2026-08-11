@@ -351,7 +351,8 @@ def interactive_login():
         # Wait until user closes the browser or navigates away from /login
         deadline = time.time() + 300
         logged_in = False
-        while time.time() < deadline:
+        browser_open = True
+        while time.time() < deadline and browser_open:
             try:
                 if "/login" not in page.url:
                     logged_in = True
@@ -361,19 +362,22 @@ def interactive_login():
                 pass
             try:
                 page.wait_for_event("close", timeout=2000)
-                print("  Browser closed.")
-                break
+                print("  Browser window closed.")
+                browser_open = False
             except Exception:
                 continue
 
-        if not logged_in:
-            print("  Note: could not confirm login. Saving whatever session exists.")
-
-        try:
-            save_session(context.storage_state())
-            print("Session saved. Uploads are now fully automatic.")
-        except Exception as e:
-            print(f"Could not save session: {e}")
+        if browser_open:
+            if not logged_in:
+                print("  Note: could not confirm login. Saving whatever session exists.")
+            try:
+                save_session(context.storage_state())
+                print("Session saved. Uploads are now fully automatic.")
+            except Exception as e:
+                print(f"Could not save session: {e}")
+        else:
+            print("  Session NOT saved (browser closed before login completed).")
+            print("  Re-run: python rumble_upload.py --login")
 
         context.close()
         browser.close()
