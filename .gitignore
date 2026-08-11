@@ -1,0 +1,14 @@
+# Secrets
+rumble_session.json
+
+# Output
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.png
+
+# OS
+.DS_Store
+Thumbs.db

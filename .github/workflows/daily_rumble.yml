@@ -1,0 +1,56 @@
+name: Daily Rumble Podcast
+
+on:
+  schedule:
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Generate episode video
+        run: |
+          mkdir -p output
+          SCRIPT=$(ls scripts/*.txt | head -1)
+          python generate_video.py "$SCRIPT" || python generate_video.py scripts/episode_01_pilot.txt
+
+      - name: Upload to Rumble
+        env:
+          RUMBLE_EMAIL: ${{ secrets.RUMBLE_EMAIL }}
+          RUMBLE_PASSWORD: ${{ secrets.RUMBLE_PASSWORD }}
+        run: |
+          VIDEO=$(find output -name 'final_video.mp4' | sort | tail -1)
+          THUMB=$(find output -name 'thumbnail.png' | sort | tail -1)
+          echo "Uploading: $VIDEO"
+          python rumble_upload.py --video "$VIDEO" --title "Cat Podcast Episode - $(date +%Y-%m-%d)" --thumbnail "$THUMB"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-${{ github.run_number }}
+          path: |
+            output/episode_*/final_video.mp4
+            output/episode_*/thumbnail.png
+          retention-days: 7
