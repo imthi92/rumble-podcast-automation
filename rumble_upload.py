@@ -21,12 +21,13 @@ If Rumble changes their site, update SELECTORS below (run with --headed to debug
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rumble_session.json")
 
-LOGIN_URL = "https://rumble.com/login"
+LOGIN_URL = "https://rumble.com/login.php"
 UPLOAD_URL = "https://rumble.com/upload"
 
 # ============================================================
@@ -35,13 +36,13 @@ UPLOAD_URL = "https://rumble.com/upload"
 SELECTORS = {
     "login_email": ["input[type=email]", "input[name=username]", "#username", "input[placeholder*=mail]", "input[placeholder*=User]"],
     "login_password": ["input[type=password]", "#password"],
-    "login_submit": ["button[type=submit]", "button[data-testid=login-submit]", "input[type=submit]"],
+    "login_submit": ["button:has-text('Log In')", "button:has-text('Sign In')", "button[type=submit]", "input[type=submit]"],
     "upload_file": ["input[type=file]", ".upload-file input", "input[name=file]"],
     "upload_title": ["input[name=title]", "#title", "input[placeholder*=title]", "input[placeholder*=Title]"],
     "upload_description": ["textarea[name=description]", "#description", "textarea[placeholder*=description]", "textarea[placeholder*=Description]"],
     "upload_tags": ["input[name=tags]", "#tags", "input[placeholder*=tags]", "input[placeholder*=Tags]"],
-    "upload_publish": ["button[type=submit]", "button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')"],
-    "visibility_public": ["input[value=public]", "label:has-text('Public')", "input[name=visibility][value=public]"],
+    "upload_publish": ["button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')", "button[type=submit]"],
+    "visibility_public": ["label:has-text('Public')", "input[value=public]", "input[name=visibility][value=public]"],
     "thumbnail_file": ["input[type=file][accept*=image]", ".thumbnail-upload input", "input[name=thumbnail]"],
 }
 
@@ -258,8 +259,8 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
             except Exception:
                 pass
 
-            # --- Fill title ---
-            if not try_fill(page, SELECTORS["upload_title"], title[:200], description="title"):
+            # --- Fill title (Rumble limit is 100 chars) ---
+            if not try_fill(page, SELECTORS["upload_title"], title[:100], description="title"):
                 print("  ! Title field not found - trying to continue.")
 
             # --- Fill description ---
@@ -291,13 +292,19 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
                 time.sleep(3)
 
                 # Wait for redirect to the video page
+                # Rumble video URLs look like https://rumble.com/vXXXXX-title-slug.html
+                # (NOT "/video/", so use a regex matching the video ID + slug dash.
+                # "videos" (listing) is excluded because it has no dash after the v.)
+                video_url_re = re.compile(r"rumble\.com/v[a-zA-Z0-9]+-")
                 try:
-                    page.wait_for_url(lambda url: "/video/" in url, timeout=45000)
+                    page.wait_for_url(
+                        lambda url: bool(video_url_re.search(url)), timeout=45000
+                    )
                 except Exception:
                     pass
 
                 url = page.url
-                if url and "/video/" in url:
+                if url and video_url_re.search(url):
                     _screenshot(page, "rumble_after_publish")
                     print("  Upload confirmed. URL:", url)
                     return url
@@ -313,10 +320,16 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
             return None
 
         finally:
-            context.close()
-            browser.close()
+            try:
+                context.close()
+                browser.close()
+            except Exception:
+                pass
     finally:
-        pw.stop()
+        try:
+            playwright.stop()
+        except Exception:
+            pass
 
 
 def _screenshot(page, name):
@@ -379,10 +392,13 @@ def interactive_login():
             print("  Session NOT saved (browser closed before login completed).")
             print("  Re-run: python rumble_upload.py --login")
 
-        context.close()
-        browser.close()
+        try:
+            context.close()
+            browser.close()
+        except Exception:
+            pass
     finally:
-        pw.stop()
+        playwright.stop()
 
 
 def build_description(episode_title):

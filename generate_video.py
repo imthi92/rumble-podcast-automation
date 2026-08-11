@@ -110,18 +110,14 @@ def make_srt(lines, seg_durations, out_path):
         f.write("\n".join(entries))
 
 
-def ffmpeg_filter_escape(path):
-    """Escape a path for use inside an ffmpeg filter (subtitles=)."""
-    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-
-
 def sanitize_drawtext(text):
     """Remove characters that break ffmpeg drawtext filters."""
     return "".join(c for c in text if c.isalnum() or c in " _-").strip() or "Untitled"
 
 
 def make_thumbnail(title, out_path):
-    """Simple thumbnail with ffmpeg."""
+    """Simple thumbnail with ffmpeg. Falls back to a plain color image
+    if text rendering is unavailable (e.g. no fonts on the runner)."""
     safe_title = sanitize_drawtext(title[:40])
     try:
         cmd = [
@@ -134,15 +130,30 @@ def make_thumbnail(title, out_path):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
-            print(f"  ! Thumbnail ffmpeg stderr: {result.stderr[:200]}")
+            print(f"  ! Thumbnail text ffmpeg stderr: {result.stderr[:200]}")
+        elif os.path.exists(out_path):
+            return out_path
     except Exception as e:
-        print(f"  ! Thumbnail generation failed: {e}")
-    return out_path if os.path.exists(out_path) else None
+        print(f"  ! Thumbnail text generation failed: {e}")
+
+    # Fallback: plain color thumbnail (valid PNG, no text needed)
+    try:
+        plain = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=#1a1a2e:s=1280x720:d=1",
+            "-frames:v", "1", out_path,
+        ]
+        result = subprocess.run(plain, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and os.path.exists(out_path):
+            print("  Thumbnail generated without text (fonts unavailable).")
+            return out_path
+    except Exception as e:
+        print(f"  ! Thumbnail fallback failed: {e}")
+    return None
 
 
-def run_ffmpeg(cmd, timeout=600):
+def run_ffmpeg(cmd, timeout=600, cwd=None):
     """Run ffmpeg and return True on success."""
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
     if result.returncode != 0:
         print(f"  ! ffmpeg stderr: {result.stderr[-500:]}")
         return False
@@ -200,18 +211,19 @@ def main(script_path, episode_title=None):
     # 4. Build video (duration from the actual concatenated audio)
     total_dur = get_audio_duration(raw_audio)
     video_path = os.path.join(out_dir, "final_video.mp4")
-    srt_filter = ffmpeg_filter_escape(srt_path)
+    # Use a relative SRT path with cwd=out_dir. Absolute paths with Windows
+    # drive letters (C\:) break the subtitles= filter option parsing.
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c=#1a1a2e:s=1280x720:d={total_dur}",
         "-i", raw_audio,
-        "-vf", f"subtitles={srt_filter}:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
+        "-vf", "subtitles=subtitles.srt:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
         "-c:v", "libx264", "-preset", "fast",
         "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
         "-shortest", video_path,
     ]
     print("Building video...")
-    if not run_ffmpeg(cmd, timeout=600):
+    if not run_ffmpeg(cmd, timeout=600, cwd=out_dir):
         print("ERROR: video generation failed")
         sys.exit(1)
 

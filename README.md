@@ -76,7 +76,7 @@ Speaker 1: First line of dialogue
 Speaker 2: Second line of dialogue
 ```
 
-The workflow picks the first script alphabetically.
+The workflow rotates through all scripts by day-of-year.
 
 ## Troubleshooting
 
