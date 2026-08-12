@@ -30,11 +30,14 @@ SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rumble_
 LOGIN_URL = "https://rumble.com/login.php"
 UPLOAD_URL = "https://rumble.com/upload"
 
+# Realistic Chrome user agent (helps pass Cloudflare's bot checks)
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
 # ============================================================
 # SELECTORS - update these if Rumble changes their site
 # ============================================================
 SELECTORS = {
-    "login_email": ["input[type=email]", "input[name=username]", "#username", "input[placeholder*=mail]", "input[placeholder*=User]"],
+    "login_email": ["input[type=email]", "input[name=username]", "input[name=email]", "#username", "#email", "input[placeholder*=mail]", "input[placeholder*=User]", "input[placeholder*=Email]", "input[autocomplete=username]", "input[name=user_id]"],
     "login_password": ["input[type=password]", "#password"],
     "login_submit": ["button:has-text('Log In')", "button:has-text('Sign In')", "button[type=submit]", "input[type=submit]"],
     "upload_file": ["input[type=file]", ".upload-file input", "input[name=file]"],
@@ -132,30 +135,53 @@ def is_logged_in(page):
     return False
 
 
+def _page_diagnostics(page, label):
+    """Print current URL, title, and whether common bot/captcha markers are present."""
+    try:
+        print(f"    [{label}] URL: {page.url}")
+        print(f"    [{label}] Title: {page.title()}")
+        content = page.content()
+        for marker in ["captcha", "cf-challenge", "Checking your browser", "access denied", "Enable JavaScript", "just a moment"]:
+            if marker.lower() in content.lower():
+                print(f"    [{label}] WARNING: bot-protection marker detected: '{marker}'")
+        inputs = page.locator("input").count()
+        print(f"    [{label}] <input> count on page: {inputs}")
+        for sel in SELECTORS["login_email"]:
+            if page.locator(sel).first.count() > 0:
+                print(f"    [{label}] email selector matched: {sel}")
+                break
+        else:
+            print(f"    [{label}] no email-field selector matched (page structure unknown)")
+    except Exception as e:
+        print(f"    [{label}] diagnostics failed: {e}")
+
+
 def login_with_credentials(page, email, password):
     """Login to Rumble using email/password."""
     print("  [auth] Logging in with credentials...")
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     time.sleep(2)
+    _page_diagnostics(page, "login-page")
 
-    if not try_fill(page, SELECTORS["login_email"], email, description="email"):
+    # Give JS-rendered forms time to appear, then try with a longer timeout
+    if not try_fill(page, SELECTORS["login_email"], email, timeout=25000, description="email"):
         print("    ERROR: email field not found. Rumble may have changed their login page.")
         _screenshot(page, "rumble_debug_login")
         return False
 
-    if not try_fill(page, SELECTORS["login_password"], password, description="password"):
+    if not try_fill(page, SELECTORS["login_password"], password, timeout=15000, description="password"):
         print("    ERROR: password field not found.")
         _screenshot(page, "rumble_debug_login")
         return False
 
-    if not try_click(page, SELECTORS["login_submit"], description="login submit"):
+    if not try_click(page, SELECTORS["login_submit"], timeout=15000, description="login submit"):
         print("    ERROR: login submit button not found.")
         _screenshot(page, "rumble_debug_login")
         return False
 
     # Wait for redirect AWAY from the login page
     try:
-        page.wait_for_url(lambda url: "/login" not in url, timeout=30000)
+        page.wait_for_url(lambda url: "/login" not in url, timeout=45000)
     except Exception:
         pass
     time.sleep(3)
@@ -194,6 +220,20 @@ def _set_thumbnail(page, thumbnail_path):
         print(f"  ! Thumbnail upload skipped: {e}")
 
 
+def _launch_browser(playwright, headed=False):
+    """Launch Chromium with flags that avoid Cloudflare Turnstile blocking
+    headless browser. Rumble's login is behind a 'Just a moment...' challenge
+    that blocks plain headless Chromium unless the automation flag is disabled."""
+    kwargs = dict(
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    )
+    if headed:
+        return playwright.chromium.launch(headless=False, **kwargs)
+    # Realistic Chrome UA keeps the challenge from bailing early
+    ctx_browser = playwright.chromium.launch(headless=True, **kwargs)
+    return ctx_browser
+
+
 def upload_video(video_path, title, description=None, tags=None, thumbnail_path=None, headed=False):
     """Upload a video to Rumble. Returns video URL or None."""
     print("\n" + "=" * 60)
@@ -211,8 +251,12 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
     pw = get_playwright()
     playwright = pw.start()
     try:
-        browser = playwright.chromium.launch(headless=not headed)
-        context = browser.new_context(storage_state=session) if session else browser.new_context()
+        browser = _launch_browser(playwright, headed=headed)
+        context = browser.new_context(
+            storage_state=session,
+            user_agent=UA,
+            viewport={"width": 1440, "height": 900},
+        ) if session else browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900})
         page = context.new_page()
 
         try:
@@ -353,8 +397,8 @@ def interactive_login():
     pw = get_playwright()
     playwright = pw.start()
     try:
-        browser = playwright.chromium.launch(headless=False)
-        context = browser.new_context()
+        browser = _launch_browser(playwright, headed=True)
+        context = browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900})
         page = context.new_page()
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
