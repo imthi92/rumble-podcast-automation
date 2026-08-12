@@ -26,8 +26,14 @@ jobs:
 
       - name: Install Playwright Chromium
         run: |
-          playwright install chromium
-          sudo playwright install-deps chromium
+          # GitHub ubuntu runners already ship Playwright OS dependencies,
+          # so only the browser binary is needed. Retry in case of CDN flakiness.
+          for i in 1 2 3; do
+            python -m playwright install chromium && break
+            echo "playwright install attempt $i failed, retrying..."
+            sleep 5
+          done
+          python -m playwright install chromium
 
       - name: Generate episode video (rotating scripts)
         run: |
