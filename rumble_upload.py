@@ -281,43 +281,40 @@ def _select_category(page, term="pets"):
     except Exception as ex:
         print(f"  (option scan failed: {ex})")
 
-    # Try to pick an option by text (wait for it to be visible/clickable)
+    # The dropdown is CSS-hidden; Playwright cannot click invisible nodes.
+    # Select the matching option by dispatching mouse events directly (the
+    # widget listens on .select-option regardless of visibility).
     picked = False
-    for sel in [
-        ".select-option",
-        ".select-search-row",
-        ".select-search-option",
-        "[role=option]",
-        ".ui-autocomplete li",
-        ".tt-suggestion",
-        "li",
-    ]:
-        try:
-            loc = page.locator(sel).filter(has_text=term).first
-            try:
-                loc.wait_for(state="visible", timeout=5000)
-            except Exception:
-                continue
-            loc.click(timeout=3000)
-            picked = True
-            print(f"  Clicked category option via {sel}.")
-            break
-        except Exception:
-            continue
-
-    # Fallback: click by data-label attribute (case-insensitive)
-    if not picked:
-        try:
-            loc = page.locator(".select-option[data-label]").filter(
-                has_text=term
-            ).first
-            if loc.count():
-                loc.click(timeout=3000)
-                picked = True
-                print("  Clicked category option via data-label filter.")
-        except Exception:
-            pass
-
+    try:
+        selected = page.evaluate("""(term) => {
+            const opts = Array.from(document.querySelectorAll('.select-option'));
+            const t = term.toLowerCase();
+            const match = opts.find(o => {
+                const lbl = (o.getAttribute('data-label') || '').toLowerCase();
+                const txt = (o.innerText || '').toLowerCase();
+                return lbl.includes(t) || txt.includes(t);
+            });
+            if (!match) return 'NO_MATCH';
+            // Fire the widget's regular click path first
+            ['mousedown', 'mouseup', 'click'].forEach(type => {
+                match.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
+            });
+            // If the widget didn't update the hidden input, force it directly
+            // and notify the form (some builds only read the hidden value).
+            setTimeout(() => {
+                const hidden = document.querySelector('.select-search-value');
+                if (hidden && hidden.value === '0' && match.getAttribute('data-value') !== '0') {
+                    hidden.value = match.getAttribute('data-value');
+                    hidden.dispatchEvent(new Event('change', { bubbles: true }));
+                    hidden.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }, 150);
+            return match.getAttribute('data-label') + '#value=' + match.getAttribute('data-value');
+        }""", term)
+        print(f"  Category JS select result: {selected}")
+        picked = selected != "NO_MATCH"
+    except Exception as ex:
+        print(f"  (JS category select failed: {ex})")
     time.sleep(1)
     try:
         val = page.locator(".select-search-value").first.input_value()
