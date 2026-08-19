@@ -628,7 +628,7 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
             try_click(page, SELECTORS["visibility_public"], timeout=8000, description="public visibility")
 
             # --- Pick a category (required; publish is blocked without it) ---
-            _select_category(page, term="pets")
+            _select_category(page, term="podcast")
 
             # --- Upload thumbnail (optional, guarded) ---
             if thumbnail_path and os.path.exists(thumbnail_path):
