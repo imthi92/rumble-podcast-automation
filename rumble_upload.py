@@ -294,7 +294,12 @@ def _select_category(page, term="pets"):
                 const txt = (o.innerText || '').toLowerCase();
                 return lbl.includes(t) || txt.includes(t);
             });
-            if (!match) return 'NO_MATCH';
+            if (!match) {
+                const labels = opts.slice(0, 40).map(o =>
+                    o.getAttribute('data-label') + '=' + o.getAttribute('data-value')
+                );
+                return 'NO_MATCH|labels=' + labels.join(',');
+            }
             // Fire the widget's regular click path first
             ['mousedown', 'mouseup', 'click'].forEach(type => {
                 match.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
