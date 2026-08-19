@@ -244,16 +244,23 @@ def _select_category(page, term="pets"):
         inp.click()
     except Exception:
         pass
-    # Type the search term slowly; the widget filters a server/local list
+    # Type the search term with real key events so the widget filters its list
     try:
-        inp.fill(term)
+        inp.fill("")
     except Exception:
-        inp.type(term)
+        pass
+    try:
+        inp.press_sequentially(term, delay=60)
+    except Exception:
+        try:
+            inp.type(term, delay=60)
+        except Exception:
+            pass
     time.sleep(2)
 
     # Dump EVERYTHING that becomes available after typing (options list)
     try:
-        candidates = page.locator(".select-search-row, .select-search-option, .select-search-options *, li, .dropdown-menu *[role=option], [role=option], .ui-autocomplete li, .tt-suggestion")
+        candidates = page.locator(".select-search-row, .select-search-option, .select-search-options *, li, .dropdown-menu *[role=option], [role=option], .ui-autocomplete li, .tt-suggestion, .select-option")
         cnt = candidates.count()
         print(f"  Post-type elements: {cnt}")
         for i in range(min(cnt, 25)):
@@ -274,7 +281,7 @@ def _select_category(page, term="pets"):
     except Exception as ex:
         print(f"  (option scan failed: {ex})")
 
-    # Try to pick an option by text
+    # Try to pick an option by text (wait for it to be visible/clickable)
     picked = False
     for sel in [
         ".select-option",
@@ -287,11 +294,14 @@ def _select_category(page, term="pets"):
     ]:
         try:
             loc = page.locator(sel).filter(has_text=term).first
-            if loc.count():
-                loc.click(timeout=3000)
-                picked = True
-                print(f"  Clicked category option via {sel}.")
-                break
+            try:
+                loc.wait_for(state="visible", timeout=5000)
+            except Exception:
+                continue
+            loc.click(timeout=3000)
+            picked = True
+            print(f"  Clicked category option via {sel}.")
+            break
         except Exception:
             continue
 
