@@ -63,4 +63,7 @@ jobs:
           path: |
             output/episode_*/final_video.mp4
             output/episode_*/thumbnail.png
+            rumble_before_publish.png
+            rumble_after_publish.png
+            rumble_debug_*.png
           retention-days: 7

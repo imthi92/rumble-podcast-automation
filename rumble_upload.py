@@ -324,7 +324,54 @@ def _dump_interactive(page, label):
                 except Exception:
                     pass
                 print(f"        [{i}] <{tag}> '{txt}' type={el.get_attribute('type')} name={el.get_attribute('name')} class={el.get_attribute('class')} href={el.get_attribute('href')}")
-        
+
+        # Form field values + radio/checkbox states (this is what matters for publish)
+        print(f"    [{label}] form values:")
+        for field, sel in [("title", "input[name=title]"), ("tags", "input[name=tags]"),
+                           ("category", "input.select-search-value"), ("description", "textarea[name=description]")]:
+            try:
+                n = page.locator(sel).count()
+                if n:
+                    val = page.locator(sel).first.input_value() or "(empty)"
+                    print(f"        {field} = '{val[:120]}'")
+            except Exception:
+                pass
+        try:
+            checked = []
+            radios = page.locator("input[name=visibility]")
+            for i in range(radios.count()):
+                state = radios.nth(i).is_checked()
+                val = radios.nth(i).get_attribute("value")
+                checked.append(f"visibility[{i}]={'CHECKED' if state else 'unchecked'}(value={val})")
+            print(f"        radios: {' '.join(checked)}")
+            for box in ["input[name=isFeaturedForUser]", "input[name=sendPush]"]:
+                try:
+                    print(f"        {box.split('=')[-1].strip('[]')} = {page.locator(box).first.is_checked()}")
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"        (radio scan failed: {e})")
+
+        # Visible error / required-field messages
+        print(f"    [{label}] validation markers:")
+        for sel in ["[class*=error]", ".error", "[class*=invalid]", "[class*=required]",
+                    "[class*=warning]", ".alert", "[role=alert]", "[class*=toast]"]:
+            try:
+                for i in range(min(page.locator(sel).count(), 5)):
+                    el = page.locator(sel).nth(i)
+                    try:
+                        err = (el.inner_text() or "").strip().replace("\n", " ")[:100]
+                    except Exception:
+                        err = "<no text>"
+                    try:
+                        vis = el.is_visible()
+                    except Exception:
+                        vis = "?"
+                    if err and vis:
+                        print(f"        {sel} [{i}] (visible={vis}): {err}")
+            except Exception:
+                continue
+
         # Also dump page HTML snippet around any "publish" or "upload" text
         content = page.content()
         for keyword in ["publish", "upload", "submit", "save"]:
