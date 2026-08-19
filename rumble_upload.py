@@ -277,6 +277,7 @@ def _select_category(page, term="pets"):
     # Try to pick an option by text
     picked = False
     for sel in [
+        ".select-option",
         ".select-search-row",
         ".select-search-option",
         "[role=option]",
@@ -293,6 +294,19 @@ def _select_category(page, term="pets"):
                 break
         except Exception:
             continue
+
+    # Fallback: click by data-label attribute (case-insensitive)
+    if not picked:
+        try:
+            loc = page.locator(".select-option[data-label]").filter(
+                has_text=term
+            ).first
+            if loc.count():
+                loc.click(timeout=3000)
+                picked = True
+                print("  Clicked category option via data-label filter.")
+        except Exception:
+            pass
 
     time.sleep(1)
     try:
