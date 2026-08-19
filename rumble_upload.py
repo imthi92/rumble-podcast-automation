@@ -220,6 +220,76 @@ def _set_thumbnail(page, thumbnail_path):
         print(f"  ! Thumbnail upload skipped: {e}")
 
 
+def _select_category(page, term="pets"):
+    """Pick a category via the jQuery 'select-search' widget Rumble uses.
+    The widget renders a visible text input (name=primary-category) that
+    opens a dropdown list of options on typing, plus a hidden
+    .select-search-value input that stores the chosen numeric ID.
+    Returns True if the hidden value changed from '0'."""
+    try:
+        box = page.locator(".select-search-box, .select-search").first
+        box.wait_for(state="visible", timeout=8000)
+    except Exception:
+        print("  ! Category widget not found.")
+        return False
+
+    inp = page.locator("input[name=primary-category]").first
+    try:
+        inp.click()
+    except Exception:
+        pass
+    # Type the search term slowly; the widget filters a server/local list
+    try:
+        inp.fill(term)
+    except Exception:
+        inp.type(term)
+    time.sleep(1.5)
+
+    # Dump the dropdown options so a mismatch is self-diagnosing
+    option_sels = [
+        ".select-search-options .select-search-row",
+        ".select-search-options .select-search-option",
+        ".select-search-select .select-search-row",
+        ".select-search-select li",
+        ".select-search-option",
+        "li.select-search-row",
+        "[class*=option]",
+    ]
+    picked = False
+    for sel in option_sels:
+        try:
+            cnt = page.locator(sel).count()
+            if not cnt:
+                continue
+            print(f"  Category options ({sel}): {cnt}")
+            for i in range(min(cnt, 12)):
+                el = page.locator(sel).nth(i)
+                try:
+                    txt = el.inner_text().strip().replace("\n", " ")[:60]
+                except Exception:
+                    txt = ""
+                try:
+                    val = el.get_attribute("data-value") or el.get_attribute("value") or ""
+                except Exception:
+                    val = ""
+                print(f"      [{i}] '{txt}' data-value={val}")
+            target = page.locator(sel).filter(has_text=term).first
+            target.click(timeout=3000)
+            picked = True
+            print(f"  Category selected via {sel} containing '{term}'.")
+            break
+        except Exception:
+            continue
+
+    time.sleep(1)
+    try:
+        val = page.locator(".select-search-value").first.input_value()
+        print(f"  Category value now: '{val}'")
+        return val != "0"
+    except Exception:
+        return picked
+
+
 def _launch_browser(playwright, headed=False):
     """Launch Chromium with flags that avoid Cloudflare Turnstile blocking
     headless browser. Rumble's login is behind a 'Just a moment...' challenge
@@ -517,6 +587,9 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
 
             # --- Set visibility to public ---
             try_click(page, SELECTORS["visibility_public"], timeout=8000, description="public visibility")
+
+            # --- Pick a category (required; publish is blocked without it) ---
+            _select_category(page, term="pets")
 
             # --- Upload thumbnail (optional, guarded) ---
             if thumbnail_path and os.path.exists(thumbnail_path):
