@@ -379,6 +379,38 @@ def _dump_interactive(page, label):
             if idx > 0:
                 snippet = content[max(0, idx-100):idx+100].replace("\n", " ")
                 print(f"    [{label}] HTML around '{keyword}': ...{snippet}...")
+
+        # The submit control itself: value, disabled state, enclosing form HTML
+        for sel in ["input.update-btn", "input.submit_content", "input.update-btn, input.submit_content, input[type=submit]"]:
+            try:
+                el = page.locator(sel).first
+                if el.count():
+                    print(f"    [{label}] submit control ({sel}):")
+                    print(f"        outerHTML: {el.evaluate('e => e.outerHTML')[:400]}")
+                    for attr in ["disabled", "class", "value", "onclick", "id"]:
+                        try:
+                            print(f"        {attr} = {el.get_attribute(attr)}")
+                        except Exception:
+                            pass
+                    try:
+                        f = el.evaluate("e => (e.closest('form') || {}).outerHTML || '(no form)'")
+                        print(f"        enclosing form: {f[:1200]}")
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+            break
+
+        # Visible page text around the bottom of the form (where the button is)
+        try:
+            all_text = page.evaluate("document.body ? document.body.innerText : ''")
+            idx = all_text.lower().find("required")
+            tail = all_text[-800:]
+            print(f"    [{label}] body text tail: ...{tail.replace(chr(10), ' | ')}")
+            if idx >= 0:
+                print(f"    [{label}] 'required' context: ...{all_text[max(0,idx-200):idx+200].replace(chr(10), ' | ')}")
+        except Exception:
+            pass
     except Exception as e:
         print(f"    [{label}] dump failed: {e}")
 
