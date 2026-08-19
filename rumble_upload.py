@@ -44,7 +44,7 @@ SELECTORS = {
     "upload_title": ["input[name=title]", "#title", "input[placeholder*=title]", "input[placeholder*=Title]"],
     "upload_description": ["textarea[name=description]", "#description", "textarea[placeholder*=description]", "textarea[placeholder*=Description]"],
     "upload_tags": ["input[name=tags]", "#tags", "input[placeholder*=tags]", "input[placeholder*=Tags]"],
-    "upload_publish": ["button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')", "button[type=submit]"],
+    "upload_publish": ["button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')", "button:has-text('Save')", "button:has-text('Start Upload')", "button:has-text('Go Live')", "button[type=submit]", "input[type=submit]", "[role=button]:has-text('Publish')", "[role=button]:has-text('Upload')", ".btn-primary:has-text('Publish')", ".btn-primary:has-text('Upload')", "button.btn-primary", "button.publish", "button.upload-btn"],
     "visibility_public": ["label:has-text('Public')", "input[value=public]", "input[name=visibility][value=public]"],
     "thumbnail_file": ["input[type=file][accept*=image]", ".thumbnail-upload input", "input[name=thumbnail]"],
 }
@@ -234,6 +234,102 @@ def _launch_browser(playwright, headed=False):
     return ctx_browser
 
 
+def _click_publish(page):
+    """Find and click the publish/submit control. Rumble's button may be a
+    <button>, <a>, <input>, or a div styled as a button, possibly below the fold.
+    Also checks inside iframes."""
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
+    selectors = [
+        "button:has-text('Publish')",
+        "button:has-text('Upload Video')",
+        "button:has-text('Submit')",
+        "button:has-text('Save')",
+        "button:has-text('Start Upload')",
+        "button:has-text('Go Live')",
+        "a:has-text('Publish')",
+        "input[type=submit]",
+        "button[type=submit]",
+        "[role=button]:has-text('Publish')",
+        "[role=button]:has-text('Upload')",
+        "[class*=submit]:has-text('Publish')",
+        "[class*=publish]",
+        "[class*=upload-btn]",
+        ".btn-primary",
+        "button.btn-primary",
+        "button.primary",
+        "form button:last-of-type",
+        "form input[type=submit]",
+    ]
+    
+    # Try main page first
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=5000)
+            loc.click()
+            print(f"  Publish clicked ({sel}).")
+            return True
+        except Exception:
+            continue
+    
+    # Try inside iframes
+    print("  Trying iframes for publish button...")
+    iframes = page.frames
+    for frame in iframes:
+        if frame == page.main_frame:
+            continue
+        for sel in selectors:
+            try:
+                loc = frame.locator(sel).first
+                loc.wait_for(state="visible", timeout=3000)
+                loc.click()
+                print(f"  Publish clicked in iframe ({sel}).")
+                return True
+            except Exception:
+                continue
+    
+    return False
+
+
+def _dump_interactive(page, label):
+    """Print the interactive elements on the page so a failed run is self-diagnosing."""
+    try:
+        print(f"    [{label}] URL: {page.url}")
+        print(f"    [{label}] Title: {page.title()}")
+        for desc, locator in [
+            ("buttons", "button"),
+            ("role=button", "[role=button]"),
+            ("links", "a[href]"),
+            ("inputs[type!=hidden]", "input:not([type=hidden])"),
+            ("textareas", "textarea"),
+            ("selects", "select"),
+            ("divs with click", "div[onclick], span[onclick]"),
+        ]:
+            loc = page.locator(locator)
+            n = loc.count()
+            print(f"    [{label}] {desc}: {n}")
+            for i in range(min(n, 20)):
+                el = loc.nth(i)
+                txt = ""
+                tag = el.evaluate("e => e.tagName")
+                try:
+                    txt = (el.inner_text() or "").replace("\n", " ")[:60]
+                except Exception:
+                    pass
+                print(f"        [{i}] <{tag}> '{txt}' type={el.get_attribute('type')} name={el.get_attribute('name')} class={el.get_attribute('class')} href={el.get_attribute('href')}")
+        
+        # Also dump page HTML snippet around any "publish" or "upload" text
+        content = page.content()
+        for keyword in ["publish", "upload", "submit", "save"]:
+            idx = content.lower().find(keyword)
+            if idx > 0:
+                snippet = content[max(0, idx-100):idx+100].replace("\n", " ")
+                print(f"    [{label}] HTML around '{keyword}': ...{snippet}...")
+    except Exception as e:
+        print(f"    [{label}] dump failed: {e}")
+
+
 def upload_video(video_path, title, description=None, tags=None, thumbnail_path=None, headed=False):
     """Upload a video to Rumble. Returns video URL or None."""
     print("\n" + "=" * 60)
@@ -297,12 +393,29 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
 
             # Wait for the file to process and the form to appear
             print("  Waiting for upload form...")
-            time.sleep(8)
+            time.sleep(10)
             try:
-                page.wait_for_load_state("networkidle", timeout=30000)
+                page.wait_for_load_state("networkidle", timeout=45000)
             except Exception:
                 pass
-
+            
+            # Wait for upload progress to complete (look for progress indicators)
+            print("  Waiting for upload to complete...")
+            for _ in range(30):  # Wait up to 30 seconds for upload to complete
+                try:
+                    # Check if upload progress is still showing
+                    progress = page.locator("[class*=progress], [class*=uploading], text=Uploading, text=100%")
+                    if progress.count() == 0:
+                        break
+                    # Check if any progress text shows 100%
+                    content = page.content()
+                    if "100%" in content or "complete" in content.lower():
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            time.sleep(3)  # Extra wait after upload completes
+            
             # --- Fill title (Rumble limit is 100 chars) ---
             if not try_fill(page, SELECTORS["upload_title"], title[:100], description="title"):
                 print("  ! Title field not found - trying to continue.")
@@ -325,8 +438,10 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
                 _set_thumbnail(page, thumbnail_path)
 
             # --- Publish ---
+            print("  Looking for publish button...")
+            _dump_interactive(page, "before-publish")
             _screenshot(page, "rumble_before_publish")
-            if try_click(page, SELECTORS["upload_publish"], timeout=10000, description="publish button"):
+            if _click_publish(page):
                 print("  Publish clicked - waiting for processing...")
                 time.sleep(5)
                 try:
@@ -353,7 +468,8 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
                     print("  Upload confirmed. URL:", url)
                     return url
 
-            # If we got here, we can't confirm success
+            # If we got here, we can't confirm success. Diagnose the form state.
+            _dump_interactive(page, "upload-form")
             _screenshot(page, "rumble_after_publish")
             for marker in ["Video uploaded", "upload successful", "successfully", "has been uploaded"]:
                 if page.locator(f"text={marker}").count() > 0:
