@@ -226,14 +226,20 @@ def _select_category(page, term="pets"):
     opens a dropdown list of options on typing, plus a hidden
     .select-search-value input that stores the chosen numeric ID.
     Returns True if the hidden value changed from '0'."""
+    inp = page.locator("input[name=primary-category]").first
     try:
-        box = page.locator(".select-search-box, .select-search").first
-        box.wait_for(state="visible", timeout=8000)
+        inp.wait_for(state="visible", timeout=8000)
     except Exception:
-        print("  ! Category widget not found.")
+        print("  ! Category input not found.")
         return False
 
-    inp = page.locator("input[name=primary-category]").first
+    # Diagnose the widget's real DOM so failures are self-documenting
+    try:
+        wrap = inp.evaluate("e => { const ps = []; let p = e; for (let i=0;i<4 && p;i++){ p = p.parentElement; if (p) ps.push(p.outerHTML.slice(0,600)); } return ps.join('\\n=====\\n'); }")
+        print(f"  Category widget parents:\n{wrap}")
+    except Exception as ex:
+        print(f"  (could not dump category HTML: {ex})")
+
     try:
         inp.click()
     except Exception:
@@ -243,41 +249,48 @@ def _select_category(page, term="pets"):
         inp.fill(term)
     except Exception:
         inp.type(term)
-    time.sleep(1.5)
+    time.sleep(2)
 
-    # Dump the dropdown options so a mismatch is self-diagnosing
-    option_sels = [
-        ".select-search-options .select-search-row",
-        ".select-search-options .select-search-option",
-        ".select-search-select .select-search-row",
-        ".select-search-select li",
-        ".select-search-option",
-        "li.select-search-row",
-        "[class*=option]",
-    ]
+    # Dump EVERYTHING that becomes available after typing (options list)
+    try:
+        candidates = page.locator(".select-search-row, .select-search-option, .select-search-options *, li, .dropdown-menu *[role=option], [role=option], .ui-autocomplete li, .tt-suggestion")
+        cnt = candidates.count()
+        print(f"  Post-type elements: {cnt}")
+        for i in range(min(cnt, 25)):
+            el = candidates.nth(i)
+            try:
+                txt = el.inner_text().strip().replace("\n", " ")[:50]
+            except Exception:
+                txt = ""
+            try:
+                vis = el.is_visible()
+            except Exception:
+                vis = "?"
+            try:
+                val = el.get_attribute("data-value") or el.get_attribute("value") or ""
+            except Exception:
+                val = ""
+            print(f"      [{i}] vis={vis} data={val} '{txt}'")
+    except Exception as ex:
+        print(f"  (option scan failed: {ex})")
+
+    # Try to pick an option by text
     picked = False
-    for sel in option_sels:
+    for sel in [
+        ".select-search-row",
+        ".select-search-option",
+        "[role=option]",
+        ".ui-autocomplete li",
+        ".tt-suggestion",
+        "li",
+    ]:
         try:
-            cnt = page.locator(sel).count()
-            if not cnt:
-                continue
-            print(f"  Category options ({sel}): {cnt}")
-            for i in range(min(cnt, 12)):
-                el = page.locator(sel).nth(i)
-                try:
-                    txt = el.inner_text().strip().replace("\n", " ")[:60]
-                except Exception:
-                    txt = ""
-                try:
-                    val = el.get_attribute("data-value") or el.get_attribute("value") or ""
-                except Exception:
-                    val = ""
-                print(f"      [{i}] '{txt}' data-value={val}")
-            target = page.locator(sel).filter(has_text=term).first
-            target.click(timeout=3000)
-            picked = True
-            print(f"  Category selected via {sel} containing '{term}'.")
-            break
+            loc = page.locator(sel).filter(has_text=term).first
+            if loc.count():
+                loc.click(timeout=3000)
+                picked = True
+                print(f"  Clicked category option via {sel}.")
+                break
         except Exception:
             continue
 
@@ -285,7 +298,7 @@ def _select_category(page, term="pets"):
     try:
         val = page.locator(".select-search-value").first.input_value()
         print(f"  Category value now: '{val}'")
-        return val != "0"
+        return val != "0" or picked
     except Exception:
         return picked
 
