@@ -46,7 +46,7 @@ SELECTORS = {
     "upload_tags": ["input[name=tags]", "#tags", "input[placeholder*=tags]", "input[placeholder*=Tags]"],
     "upload_publish": ["button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')", "button:has-text('Save')", "button:has-text('Start Upload')", "button:has-text('Go Live')", "button[type=submit]", "input[type=submit]", "[role=button]:has-text('Publish')", "[role=button]:has-text('Upload')", ".btn-primary:has-text('Publish')", ".btn-primary:has-text('Upload')", "button.btn-primary", "button.publish", "button.upload-btn"],
     "visibility_public": ["label:has-text('Public')", "input[value=public]", "input[name=visibility][value=public]"],
-    "thumbnail_file": ["input[type=file][accept*=image]", ".thumbnail-upload input", "input[name=thumbnail]"],
+    "thumbnail_file": ["input[name=customThumb]", "input[type=file][accept*=image]", ".thumbnail-upload input", "input[name=thumbnail]"],
 }
 
 DEFAULT_DESCRIPTION = """Cat Podcast with Simba and Meow - fully AI generated.
@@ -241,6 +241,18 @@ def _click_publish(page):
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     time.sleep(1)
     selectors = [
+        "input.update-btn",
+        "input.submit_content",
+        "input[name=submit]",
+        "input[type=submit]",
+        "button[type=submit]",
+        "button.update-btn",
+        "button.submit_content",
+        ".update-btn",
+        ".submit_content",
+        "input[type=button][class*=submit]",
+        "input[type=button][class*=update]",
+        "input[type=button]",
         "button:has-text('Publish')",
         "button:has-text('Upload Video')",
         "button:has-text('Submit')",
@@ -248,17 +260,11 @@ def _click_publish(page):
         "button:has-text('Start Upload')",
         "button:has-text('Go Live')",
         "a:has-text('Publish')",
-        "input[type=submit]",
-        "button[type=submit]",
         "[role=button]:has-text('Publish')",
         "[role=button]:has-text('Upload')",
         "[class*=submit]:has-text('Publish')",
         "[class*=publish]",
         "[class*=upload-btn]",
-        ".btn-primary",
-        "button.btn-primary",
-        "button.primary",
-        "form button:last-of-type",
         "form input[type=submit]",
     ]
     
