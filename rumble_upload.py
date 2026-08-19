@@ -343,6 +343,35 @@ def _launch_browser(playwright, headed=False):
     return ctx_browser
 
 
+def _accept_terms(page):
+    """Rumble's upload is two-stage: after clicking Upload, a second step
+    requires checking agreement checkboxes (exclusive + Terms of Service)
+    before the video is actually published. Find and tick any unchecked
+    checkbox whose label mentions agreement/terms/exclusive."""
+    try:
+        result = page.evaluate("""() => {
+            const boxes = Array.from(document.querySelectorAll('input[type=checkbox]'));
+            const targets = [];
+            for (const cb of boxes) {
+                if (cb.checked) continue;
+                const ctx = (cb.closest('label') || {}).innerText || '';
+                const parentText = (cb.parentElement ? cb.parentElement.innerText : '') || '';
+                const all = (ctx + ' ' + parentText).toLowerCase();
+                if (/exclusive agreement|terms of service|agree to our|i agree|check here if you agree/.test(all)) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    cb.dispatchEvent(new Event('input', { bubbles: true }));
+                    targets.push(cb.name || cb.id || '(unnamed)');
+                }
+            }
+            return targets.join(',') || 'NONE';
+        }""")
+        print(f"  Agreement checkboxes ticked: {result}")
+        time.sleep(1)
+    except Exception as e:
+        print(f"  ! _accept_terms failed: {e}")
+
+
 def _click_publish(page):
     """Find and click the publish/submit control. Rumble's button may be a
     <button>, <a>, <input>, or a div styled as a button, possibly below the fold.
@@ -424,7 +453,7 @@ def _dump_interactive(page, label):
             loc = page.locator(locator)
             n = loc.count()
             print(f"    [{label}] {desc}: {n}")
-            for i in range(min(n, 20)):
+            for i in range(min(n, 40)):
                 el = loc.nth(i)
                 txt = ""
                 tag = el.evaluate("e => e.tagName")
@@ -640,6 +669,23 @@ def upload_video(video_path, title, description=None, tags=None, thumbnail_path=
             _screenshot(page, "rumble_before_publish")
             if _click_publish(page):
                 print("  Publish clicked - waiting for processing...")
+                time.sleep(4)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=30000)
+                except Exception:
+                    pass
+                time.sleep(2)
+
+                # Rumble shows a licensing/ToS agreement step after the first click.
+                # Tick the required boxes, then click the submit control again.
+                _accept_terms(page)
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
+                time.sleep(1)
+                _click_publish(page)
+                print("  Final submit clicked - waiting for processing...")
                 time.sleep(5)
                 try:
                     page.wait_for_load_state("networkidle", timeout=45000)
