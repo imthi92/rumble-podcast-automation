@@ -18,8 +18,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg (preinstalled on ubuntu-latest)
-        run: ffmpeg -version | head -1
+      - name: Install FFmpeg (static binary, avoids apt)
+        run: |
+          ffmpeg -version >/dev/null 2>&1 && echo "ffmpeg already present" && ffmpeg -version | head -1 || {
+            cd /tmp
+            curl -sSL -o ffmpeg.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar xf ffmpeg.tar.xz
+            FF=$(find /tmp -maxdepth 2 -name ffmpeg -type f | head -1)
+            sudo cp "$FF" /usr/local/bin/ffmpeg
+            ffmpeg -version | head -1
+          }
 
       - name: Install dependencies
         run: pip install -r requirements.txt
