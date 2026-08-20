@@ -1,846 +1,720 @@
 #!/usr/bin/env python3
 """
-Rumble Upload Automation - Cat Podcast
-Uploads videos to Rumble using Playwright browser automation.
+rumble_upload.py — Automated video upload to Rumble.com
 
-One-time setup (on your machine, any day):
-    python rumble_upload.py --login
-    -> Browser opens, you sign in to Rumble once, session saved to rumble_session.json
+Usage:
+    python rumble_upload.py <video_path> [--thumbnail <path>] [--title <title>] ...
 
-After that, uploads are fully automatic (no login needed):
-    python rumble_upload.py <video.mp4> <title> [description] [thumbnail.png]
+Environment variables:
+    RUMBLE_EMAIL     — Rumble account email/username
+    RUMBLE_PASSWORD   — Rumble account password
 
-Fully-automatic cloud mode (no saved session required):
-    Set RUMBLE_EMAIL + RUMBLE_PASSWORD env vars and the script logs in headlessly.
-    Used by the GitHub Actions workflow so nothing runs on your laptop.
-
-IMPORTANT: Rumble has no public upload API. This automates the web upload form.
-If Rumble changes their site, update SELECTORS below (run with --headed to debug).
+If --title, --description, --tags are omitted, the script looks for
+metadata.json in the same directory as the video file.
 """
 
-import argparse
-import json
 import os
-import re
 import sys
+import json
 import time
+import argparse
+from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rumble_session.json")
+# ═════════════════════════════════════════════════════════════
+#  Configuration
+# ═════════════════════════════════════════════════════════════
 
-LOGIN_URL = "https://rumble.com/login.php"
-UPLOAD_URL = "https://rumble.com/upload"
+RUMBLE_EMAIL    = os.environ.get('RUMBLE_EMAIL', '')
+RUMBLE_PASSWORD = os.environ.get('RUMBLE_PASSWORD', '')
 
-# Realistic Chrome user agent (helps pass Cloudflare's bot checks)
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+LOGIN_URL    = 'https://auth.rumble.com/?theme=s&redirect_uri=https%3A%2F%2Frumble.com%2F&lang=en_US'
+UPLOAD_URL   = 'https://rumble.com/upload.php'
+SESSION_FILE = Path('rumble_session.json')
 
-# ============================================================
-# SELECTORS - update these if Rumble changes their site
-# ============================================================
-SELECTORS = {
-    "login_email": ["input[type=email]", "input[name=username]", "input[name=email]", "#username", "#email", "input[placeholder*=mail]", "input[placeholder*=User]", "input[placeholder*=Email]", "input[autocomplete=username]", "input[name=user_id]"],
-    "login_password": ["input[type=password]", "#password"],
-    "login_submit": ["button:has-text('Log In')", "button:has-text('Sign In')", "button[type=submit]", "input[type=submit]"],
-    "upload_file": ["input[type=file]", ".upload-file input", "input[name=file]"],
-    "upload_title": ["input[name=title]", "#title", "input[placeholder*=title]", "input[placeholder*=Title]"],
-    "upload_description": ["textarea[name=description]", "#description", "textarea[placeholder*=description]", "textarea[placeholder*=Description]"],
-    "upload_tags": ["input[name=tags]", "#tags", "input[placeholder*=tags]", "input[placeholder*=Tags]"],
-    "upload_publish": ["button:has-text('Publish')", "button:has-text('Upload Video')", "button:has-text('Submit')", "button:has-text('Save')", "button:has-text('Start Upload')", "button:has-text('Go Live')", "button[type=submit]", "input[type=submit]", "[role=button]:has-text('Publish')", "[role=button]:has-text('Upload')", ".btn-primary:has-text('Publish')", ".btn-primary:has-text('Upload')", "button.btn-primary", "button.publish", "button.upload-btn"],
-    "visibility_public": ["label:has-text('Public')", "input[value=public]", "input[name=visibility][value=public]"],
-    "thumbnail_file": ["input[name=customThumb]", "input[type=file][accept*=image]", ".thumbnail-upload input", "input[name=thumbnail]"],
-}
+SCREENSHOT_BEFORE = 'rumble_before_publish.png'
+SCREENSHOT_AFTER  = 'rumble_after_publish.png'
 
-DEFAULT_DESCRIPTION = """Cat Podcast with Simba and Meow - fully AI generated.
+# Default category value (Rumble custom select data-value)
+# 14 = Comedy — adjust as needed for your podcast
+DEFAULT_CATEGORY_VALUE = '14'
 
-Simba (Marketing, confident, slightly stupid) and Meow (Finance, intelligent, sarcastic) talk about office life, workplace drama, and cat things.
-
-New episodes daily!
-
-#CatPodcast #SimbaAndMeow #FunnyCats #OfficeHumor"""
-
-DEFAULT_TAGS = "cat podcast,furry cats,office cats,cat comedy,simba and meow,funny cats,office humor,workplace comedy,cat dialogue"
+# Timeouts
+UPLOAD_COMPLETE_TIMEOUT = 300_000   # 5 minutes for file upload
+PUBLISH_REDIRECT_TIMEOUT = 60_000  # 1 minute for post-publish redirect
 
 
-def load_session():
-    if os.path.exists(SESSION_FILE):
-        with open(SESSION_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+# ═════════════════════════════════════════════════════════════
+#  Helper: logging
+# ═════════════════════════════════════════════════════════════
+
+def log(msg=''):
+    print(msg, flush=True)
 
 
-def save_session(state):
-    with open(SESSION_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    print(f"  Session saved to {SESSION_FILE}")
+# ═════════════════════════════════════════════════════════════
+#  Helper: find metadata alongside video
+# ═════════════════════════════════════════════════════════════
 
+def find_metadata(video_path):
+    """Look for metadata.json and thumbnail in the video's directory."""
+    video_dir = Path(video_path).parent
+    meta_file = video_dir / 'metadata.json'
 
-def get_playwright():
-    try:
-        from playwright.sync_api import sync_playwright
-        return sync_playwright()
-    except ImportError:
-        print("=" * 60)
-        print("Playwright not installed. One-time install:")
-        print("  pip install playwright")
-        print("  playwright install chromium")
-        print("=" * 60)
-        sys.exit(1)
+    defaults = {
+        'title':       video_dir.name,
+        'description': '',
+        'tags':        '',
+        'category':    DEFAULT_CATEGORY_VALUE,
+        'thumbnail':   None,
+    }
 
-
-def try_click(page, selectors, timeout=15000, description="element"):
-    """Click the first matching selector. Returns True on success."""
-    for sel in selectors:
+    if meta_file.exists():
         try:
-            loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=timeout)
-            loc.click()
-            return True
-        except Exception:
-            continue
-    print(f"  ! Could not find/click: {description}")
-    return False
-
-
-def try_fill(page, selectors, value, timeout=15000, description="field"):
-    """Fill the first matching selector. Returns True on success."""
-    if not value:
-        return True
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=timeout)
-            loc.fill(value)
-            return True
-        except Exception:
-            continue
-    print(f"  ! Could not find/fill: {description}")
-    return False
-
-
-def is_logged_in(page):
-    """Heuristic: upload page should show upload UI, not a login form."""
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except Exception:
-        pass
-    # Look for the file upload control (may be hidden -> check "attached")
-    for sel in SELECTORS["upload_file"]:
-        try:
-            page.locator(sel).first.wait_for(state="attached", timeout=5000)
-            return True
-        except Exception:
-            continue
-    # If we got redirected to login, we're not logged in
-    if "/login" in page.url:
-        return False
-    return False
-
-
-def _page_diagnostics(page, label):
-    """Print current URL, title, and whether common bot/captcha markers are present."""
-    try:
-        print(f"    [{label}] URL: {page.url}")
-        print(f"    [{label}] Title: {page.title()}")
-        content = page.content()
-        for marker in ["captcha", "cf-challenge", "Checking your browser", "access denied", "Enable JavaScript", "just a moment"]:
-            if marker.lower() in content.lower():
-                print(f"    [{label}] WARNING: bot-protection marker detected: '{marker}'")
-        inputs = page.locator("input").count()
-        print(f"    [{label}] <input> count on page: {inputs}")
-        for sel in SELECTORS["login_email"]:
-            if page.locator(sel).first.count() > 0:
-                print(f"    [{label}] email selector matched: {sel}")
-                break
-        else:
-            print(f"    [{label}] no email-field selector matched (page structure unknown)")
-    except Exception as e:
-        print(f"    [{label}] diagnostics failed: {e}")
-
-
-def login_with_credentials(page, email, password):
-    """Login to Rumble using email/password."""
-    print("  [auth] Logging in with credentials...")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    time.sleep(2)
-    _page_diagnostics(page, "login-page")
-
-    # Give JS-rendered forms time to appear, then try with a longer timeout
-    if not try_fill(page, SELECTORS["login_email"], email, timeout=25000, description="email"):
-        print("    ERROR: email field not found. Rumble may have changed their login page.")
-        _screenshot(page, "rumble_debug_login")
-        return False
-
-    if not try_fill(page, SELECTORS["login_password"], password, timeout=15000, description="password"):
-        print("    ERROR: password field not found.")
-        _screenshot(page, "rumble_debug_login")
-        return False
-
-    if not try_click(page, SELECTORS["login_submit"], timeout=15000, description="login submit"):
-        print("    ERROR: login submit button not found.")
-        _screenshot(page, "rumble_debug_login")
-        return False
-
-    # Wait for redirect AWAY from the login page
-    try:
-        page.wait_for_url(lambda url: "/login" not in url, timeout=45000)
-    except Exception:
-        pass
-    time.sleep(3)
-
-    if "/login" in page.url:
-        print("    ERROR: still on login page - wrong credentials or blocked.")
-        _screenshot(page, "rumble_debug_login")
-        return False
-
-    print("    Login successful.")
-    return True
-
-
-def _set_thumbnail(page, thumbnail_path):
-    """Set thumbnail only if a dedicated thumbnail file input exists.
-    Never touches the video file input (first input[type=file] on the page)."""
-    try:
-        file_inputs = page.locator("input[type=file]")
-        count = file_inputs.count()
-        if count <= 1:
-            print("  ! No separate thumbnail field found, skipping thumbnail.")
-            return
-        # Use a dedicated image-accepting input if present
-        for sel in SELECTORS["thumbnail_file"]:
-            try:
-                page.locator(sel).first.wait_for(state="attached", timeout=3000)
-                page.locator(sel).first.set_input_files(thumbnail_path)
-                print("  Thumbnail set.")
-                return
-            except Exception:
-                continue
-        # Fallback: last file input is probably the thumbnail
-        file_inputs.nth(count - 1).set_input_files(thumbnail_path)
-        print("  Thumbnail set (last file input).")
-    except Exception as e:
-        print(f"  ! Thumbnail upload skipped: {e}")
-
-
-def _select_category(page, term="pets"):
-    """Pick a category via the jQuery 'select-search' widget Rumble uses.
-    The widget renders a visible text input (name=primary-category) that
-    opens a dropdown list of options on typing, plus a hidden
-    .select-search-value input that stores the chosen numeric ID.
-    Returns True if the hidden value changed from '0'."""
-    inp = page.locator("input[name=primary-category]").first
-    try:
-        inp.wait_for(state="visible", timeout=8000)
-    except Exception:
-        print("  ! Category input not found.")
-        return False
-
-    # Diagnose the widget's real DOM so failures are self-documenting
-    try:
-        wrap = inp.evaluate("e => { const ps = []; let p = e; for (let i=0;i<4 && p;i++){ p = p.parentElement; if (p) ps.push(p.outerHTML.slice(0,600)); } return ps.join('\\n=====\\n'); }")
-        print(f"  Category widget parents:\n{wrap}")
-    except Exception as ex:
-        print(f"  (could not dump category HTML: {ex})")
-
-    try:
-        inp.click()
-    except Exception:
-        pass
-    # Type the search term with real key events so the widget filters its list
-    try:
-        inp.fill("")
-    except Exception:
-        pass
-    try:
-        inp.press_sequentially(term, delay=60)
-    except Exception:
-        try:
-            inp.type(term, delay=60)
-        except Exception:
-            pass
-    time.sleep(2)
-
-    # Dump EVERYTHING that becomes available after typing (options list)
-    try:
-        candidates = page.locator(".select-search-row, .select-search-option, .select-search-options *, li, .dropdown-menu *[role=option], [role=option], .ui-autocomplete li, .tt-suggestion, .select-option")
-        cnt = candidates.count()
-        print(f"  Post-type elements: {cnt}")
-        for i in range(min(cnt, 25)):
-            el = candidates.nth(i)
-            try:
-                txt = el.inner_text().strip().replace("\n", " ")[:50]
-            except Exception:
-                txt = ""
-            try:
-                vis = el.is_visible()
-            except Exception:
-                vis = "?"
-            try:
-                val = el.get_attribute("data-value") or el.get_attribute("value") or ""
-            except Exception:
-                val = ""
-            print(f"      [{i}] vis={vis} data={val} '{txt}'")
-    except Exception as ex:
-        print(f"  (option scan failed: {ex})")
-
-    # The dropdown is CSS-hidden; Playwright cannot click invisible nodes.
-    # Select the matching option by dispatching mouse events directly (the
-    # widget listens on .select-option regardless of visibility).
-    picked = False
-    try:
-        selected = page.evaluate("""(term) => {
-            const opts = Array.from(document.querySelectorAll('.select-option'));
-            const t = term.toLowerCase();
-            const match = opts.find(o => {
-                const lbl = (o.getAttribute('data-label') || '').toLowerCase();
-                const txt = (o.innerText || '').toLowerCase();
-                return lbl.includes(t) || txt.includes(t);
-            });
-            if (!match) {
-                const labels = opts.slice(0, 40).map(o =>
-                    o.getAttribute('data-label') + '=' + o.getAttribute('data-value')
-                );
-                return 'NO_MATCH|labels=' + labels.join(',');
-            }
-            // Fire the widget's regular click path first
-            ['mousedown', 'mouseup', 'click'].forEach(type => {
-                match.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
-            });
-            // If the widget didn't update the hidden input, force it directly
-            // and notify the form (some builds only read the hidden value).
-            setTimeout(() => {
-                const hidden = document.querySelector('.select-search-value');
-                if (hidden && hidden.value === '0' && match.getAttribute('data-value') !== '0') {
-                    hidden.value = match.getAttribute('data-value');
-                    hidden.dispatchEvent(new Event('change', { bubbles: true }));
-                    hidden.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-            }, 150);
-            return match.getAttribute('data-label') + '#value=' + match.getAttribute('data-value');
-        }""", term)
-        print(f"  Category JS select result: {selected}")
-        picked = selected != "NO_MATCH"
-    except Exception as ex:
-        print(f"  (JS category select failed: {ex})")
-    time.sleep(1)
-    try:
-        val = page.locator(".select-search-value").first.input_value()
-        print(f"  Category value now: '{val}'")
-        return val != "0" or picked
-    except Exception:
-        return picked
-
-
-def _launch_browser(playwright, headed=False):
-    """Launch Chromium with flags that avoid Cloudflare Turnstile blocking
-    headless browser. Rumble's login is behind a 'Just a moment...' challenge
-    that blocks plain headless Chromium unless the automation flag is disabled."""
-    kwargs = dict(
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    )
-    if headed:
-        return playwright.chromium.launch(headless=False, **kwargs)
-    # Realistic Chrome UA keeps the challenge from bailing early
-    ctx_browser = playwright.chromium.launch(headless=True, **kwargs)
-    return ctx_browser
-
-
-def _accept_terms(page):
-    """Rumble's upload is two-stage: after clicking Upload, a second step
-    requires checking agreement checkboxes (exclusive + Terms of Service)
-    before the video is actually published. Find and tick any unchecked
-    checkbox whose label mentions agreement/terms/exclusive."""
-    try:
-        result = page.evaluate("""() => {
-            const boxes = Array.from(document.querySelectorAll('input[type=checkbox]'));
-            const targets = [];
-            for (const cb of boxes) {
-                if (cb.checked) continue;
-                const ctx = (cb.closest('label') || {}).innerText || '';
-                const parentText = (cb.parentElement ? cb.parentElement.innerText : '') || '';
-                const all = (ctx + ' ' + parentText).toLowerCase();
-                if (/exclusive agreement|terms of service|agree to our|i agree|check here if you agree/.test(all)) {
-                    cb.checked = true;
-                    cb.dispatchEvent(new Event('change', { bubbles: true }));
-                    cb.dispatchEvent(new Event('input', { bubbles: true }));
-                    targets.push(cb.name || cb.id || '(unnamed)');
-                }
-            }
-            return targets.join(',') || 'NONE';
-        }""")
-        print(f"  Agreement checkboxes ticked: {result}")
-        time.sleep(1)
-    except Exception as e:
-        print(f"  ! _accept_terms failed: {e}")
-
-
-def _click_publish(page):
-    """Find and click the publish/submit control. Rumble's button may be a
-    <button>, <a>, <input>, or a div styled as a button, possibly below the fold.
-    Also checks inside iframes."""
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(1)
-    selectors = [
-        "input.update-btn",
-        "input.submit_content",
-        "input[name=submit]",
-        "input[type=submit]",
-        "button[type=submit]",
-        "button.update-btn",
-        "button.submit_content",
-        ".update-btn",
-        ".submit_content",
-        "input[type=button][class*=submit]",
-        "input[type=button][class*=update]",
-        "input[type=button]",
-        "button:has-text('Publish')",
-        "button:has-text('Upload Video')",
-        "button:has-text('Submit')",
-        "button:has-text('Save')",
-        "button:has-text('Start Upload')",
-        "button:has-text('Go Live')",
-        "a:has-text('Publish')",
-        "[role=button]:has-text('Publish')",
-        "[role=button]:has-text('Upload')",
-        "[class*=submit]:has-text('Publish')",
-        "[class*=publish]",
-        "[class*=upload-btn]",
-        "form input[type=submit]",
-    ]
-    
-    # Try main page first
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=5000)
-            loc.click()
-            print(f"  Publish clicked ({sel}).")
-            return True
-        except Exception:
-            continue
-    
-    # Try inside iframes
-    print("  Trying iframes for publish button...")
-    iframes = page.frames
-    for frame in iframes:
-        if frame == page.main_frame:
-            continue
-        for sel in selectors:
-            try:
-                loc = frame.locator(sel).first
-                loc.wait_for(state="visible", timeout=3000)
-                loc.click()
-                print(f"  Publish clicked in iframe ({sel}).")
-                return True
-            except Exception:
-                continue
-    
-    return False
-
-
-def _dump_interactive(page, label):
-    """Print the interactive elements on the page so a failed run is self-diagnosing."""
-    try:
-        print(f"    [{label}] URL: {page.url}")
-        print(f"    [{label}] Title: {page.title()}")
-        for desc, locator in [
-            ("buttons", "button"),
-            ("role=button", "[role=button]"),
-            ("links", "a[href]"),
-            ("inputs[type!=hidden]", "input:not([type=hidden])"),
-            ("textareas", "textarea"),
-            ("selects", "select"),
-            ("divs with click", "div[onclick], span[onclick]"),
-        ]:
-            loc = page.locator(locator)
-            n = loc.count()
-            print(f"    [{label}] {desc}: {n}")
-            for i in range(min(n, 40)):
-                el = loc.nth(i)
-                txt = ""
-                tag = el.evaluate("e => e.tagName")
-                try:
-                    txt = (el.inner_text() or "").replace("\n", " ")[:60]
-                except Exception:
-                    pass
-                print(f"        [{i}] <{tag}> '{txt}' type={el.get_attribute('type')} name={el.get_attribute('name')} class={el.get_attribute('class')} href={el.get_attribute('href')}")
-
-        # Form field values + radio/checkbox states (this is what matters for publish)
-        print(f"    [{label}] form values:")
-        for field, sel in [("title", "input[name=title]"), ("tags", "input[name=tags]"),
-                           ("category", "input.select-search-value"), ("description", "textarea[name=description]")]:
-            try:
-                n = page.locator(sel).count()
-                if n:
-                    val = page.locator(sel).first.input_value() or "(empty)"
-                    print(f"        {field} = '{val[:120]}'")
-            except Exception:
-                pass
-        try:
-            checked = []
-            radios = page.locator("input[name=visibility]")
-            for i in range(radios.count()):
-                state = radios.nth(i).is_checked()
-                val = radios.nth(i).get_attribute("value")
-                checked.append(f"visibility[{i}]={'CHECKED' if state else 'unchecked'}(value={val})")
-            print(f"        radios: {' '.join(checked)}")
-            for box in ["input[name=isFeaturedForUser]", "input[name=sendPush]"]:
-                try:
-                    print(f"        {box.split('=')[-1].strip('[]')} = {page.locator(box).first.is_checked()}")
-                except Exception:
-                    pass
+            data = json.loads(meta_file.read_text())
+            defaults.update(data)
         except Exception as e:
-            print(f"        (radio scan failed: {e})")
+            log(f'  [metadata] Warning: could not parse {meta_file}: {e}')
 
-        # Visible error / required-field messages
-        print(f"    [{label}] validation markers:")
-        for sel in ["[class*=error]", ".error", "[class*=invalid]", "[class*=required]",
-                    "[class*=warning]", ".alert", "[role=alert]", "[class*=toast]"]:
-            try:
-                for i in range(min(page.locator(sel).count(), 5)):
-                    el = page.locator(sel).nth(i)
-                    try:
-                        err = (el.inner_text() or "").strip().replace("\n", " ")[:100]
-                    except Exception:
-                        err = "<no text>"
-                    try:
-                        vis = el.is_visible()
-                    except Exception:
-                        vis = "?"
-                    if err and vis:
-                        print(f"        {sel} [{i}] (visible={vis}): {err}")
-            except Exception:
-                continue
+    # Look for a thumbnail image if none specified
+    if not defaults.get('thumbnail'):
+        for name in ('thumbnail.jpg', 'thumbnail.png', 'thumb.jpg', 'thumb.png'):
+            candidate = video_dir / name
+            if candidate.exists():
+                defaults['thumbnail'] = str(candidate)
+                break
 
-        # Also dump page HTML snippet around any "publish" or "upload" text
-        content = page.content()
-        for keyword in ["publish", "upload", "submit", "save"]:
-            idx = content.lower().find(keyword)
-            if idx > 0:
-                snippet = content[max(0, idx-100):idx+100].replace("\n", " ")
-                print(f"    [{label}] HTML around '{keyword}': ...{snippet}...")
+    return defaults
 
-        # The submit control itself: value, disabled state, enclosing form HTML
-        for sel in ["input.update-btn", "input.submit_content", "input.update-btn, input.submit_content, input[type=submit]"]:
-            try:
-                el = page.locator(sel).first
-                if el.count():
-                    print(f"    [{label}] submit control ({sel}):")
-                    print(f"        outerHTML: {el.evaluate('e => e.outerHTML')[:400]}")
-                    for attr in ["disabled", "class", "value", "onclick", "id"]:
-                        try:
-                            print(f"        {attr} = {el.get_attribute(attr)}")
-                        except Exception:
-                            pass
-                    try:
-                        f = el.evaluate("e => (e.closest('form') || {}).outerHTML || '(no form)'")
-                        print(f"        enclosing form: {f[:1200]}")
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-            break
 
-        # Visible page text around the bottom of the form (where the button is)
+# ═════════════════════════════════════════════════════════════
+#  RumbleUploader
+# ═════════════════════════════════════════════════════════════
+
+class RumbleUploader:
+
+    def __init__(self, headless=True):
+        self.headless   = headless
+        self.playwright = None
+        self.browser    = None
+        self.context    = None
+        self.page       = None
+
+    # ─────────────────────────────────────────────
+    #  Browser lifecycle
+    # ─────────────────────────────────────────────
+
+    def start(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
+            headless=self.headless,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+            ],
+        )
+        self.context = self.context_new()
+        self.page = self.context.new_page()
+
+    def stop(self):
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
+
+    def context_new(self):
+        """Create a browser context with sensible defaults."""
+        return self.browser.new_context(
+            user_agent=(
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ),
+            viewport={'width': 1280, 'height': 800},
+            accept_images=True,
+        )
+
+    # ─────────────────────────────────────────────
+    #  Session management
+    # ─────────────────────────────────────────────
+
+    def _has_saved_session(self):
+        if not SESSION_FILE.exists():
+            return False
         try:
-            all_text = page.evaluate("document.body ? document.body.innerText : ''")
-            idx = all_text.lower().find("required")
-            tail = all_text[-800:]
-            print(f"    [{label}] body text tail: ...{tail.replace(chr(10), ' | ')}")
-            if idx >= 0:
-                print(f"    [{label}] 'required' context: ...{all_text[max(0,idx-200):idx+200].replace(chr(10), ' | ')}")
+            data = json.loads(SESSION_FILE.read_text())
+            return bool(data.get('cookies'))
         except Exception:
-            pass
-    except Exception as e:
-        print(f"    [{label}] dump failed: {e}")
+            return False
 
-
-def upload_video(video_path, title, description=None, tags=None, thumbnail_path=None, headed=False):
-    """Upload a video to Rumble. Returns video URL or None."""
-    print("\n" + "=" * 60)
-    print("RUMBLE UPLOAD")
-    print("=" * 60)
-
-    if not os.path.exists(video_path):
-        print(f"ERROR: video not found: {video_path}")
-        return None
-
-    email = os.environ.get("RUMBLE_EMAIL", "")
-    password = os.environ.get("RUMBLE_PASSWORD", "")
-    session = load_session()
-
-    pw = get_playwright()
-    playwright = pw.start()
-    try:
-        browser = _launch_browser(playwright, headed=headed)
-        context = browser.new_context(
-            storage_state=session,
-            user_agent=UA,
-            viewport={"width": 1440, "height": 900},
-        ) if session else browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900})
-        page = context.new_page()
-
+    def _restore_session(self):
         try:
-            # --- Ensure logged in ---
-            page.goto(UPLOAD_URL, wait_until="domcontentloaded")
+            data = json.loads(SESSION_FILE.read_text())
+            self.context.add_cookies(data.get('cookies', []))
+            return True
+        except Exception as e:
+            log(f'  [session] Restore failed: {e}')
+            return False
+
+    def _save_session(self):
+        cookies = self.context.cookies()
+        SESSION_FILE.write_text(json.dumps({'cookies': cookies}, indent=2))
+        log(f'  Session saved to {SESSION_FILE.resolve()}')
+
+    # ─────────────────────────────────────────────
+    #  Authentication
+    # ─────────────────────────────────────────────
+
+    def _is_logged_in(self):
+        """Check whether the current page shows an authenticated state."""
+        try:
+            # If we can see the upload form, we're logged in
+            file_input = self.page.locator('input[name=Filedata]')
+            return file_input.count() > 0
+        except Exception:
+            return False
+
+    def _login(self):
+        log('  [auth] Logging in with credentials...')
+        page = self.page
+
+        page.goto(LOGIN_URL, wait_until='networkidle')
+        time.sleep(2)
+
+        log(f'    [login-page] URL: {page.url}')
+        log(f'    [login-page] Title: {page.title()}')
+
+        # Detect bot protection
+        captcha = page.locator('[id*=captcha], [class*=captcha], [data-captcha]')
+        if captcha.count() > 0:
+            log("    [login-page] WARNING: bot-protection marker detected: 'captcha'")
+
+        input_count = page.locator('input').count()
+        log(f'    [login-page] <input> count on page: {input_count}')
+
+        # Fill username/email
+        email_sel = 'input[name=username]'
+        if page.locator(email_sel).count() > 0:
+            log(f'    [login-page] email selector matched: input[name=username]')
+            page.fill(email_sel, RUMBLE_EMAIL)
+        else:
+            page.fill('input[type=email], input[name=email]', RUMBLE_EMAIL)
+
+        # Fill password
+        page.fill('input[type=password], input[name=password]', RUMBLE_PASSWORD)
+
+        # Submit
+        page.locator(
+            'button[type=submit], button:has-text("Sign in"), '
+            'button:has-text("Log in"), input[type=submit]'
+        ).first.click()
+
+        # Wait for redirect away from auth page
+        try:
+            page.wait_for_url(
+                lambda url: 'rumble.com' in url and 'auth.rumble' not in url,
+                timeout=30_000,
+            )
+            log('  Login successful.')
+            return True
+        except PlaywrightTimeoutError:
+            log('  Login failed — timeout waiting for redirect.')
+            return False
+
+    def _ensure_logged_in(self):
+        """Restore session or log in fresh."""
+        if self._has_saved_session():
+            log('  Restoring saved session...')
+            self._restore_session()
+
+        # Navigate to upload page
+        self.page.goto(UPLOAD_URL, wait_until='networkidle')
+        time.sleep(2)
+
+        if self._is_logged_in():
+            log('  Session is valid.')
+        else:
+            log('  No valid session, logging in...')
+            if not self._login():
+                raise RuntimeError('Login failed.')
+            # Navigate back to upload page after login
+            self.page.goto(UPLOAD_URL, wait_until='networkidle')
             time.sleep(2)
 
-            if not is_logged_in(page):
-                print("  No valid session, logging in...")
-                if not (email and password):
-                    print("  ERROR: No saved session and no RUMBLE_EMAIL/RUMBLE_PASSWORD set.")
-                    print("  Run once: python rumble_upload.py --login")
-                    print("  Or set env vars for cloud automation.")
-                    return None
-                if not login_with_credentials(page, email, password):
-                    return None
-                save_session(context.storage_state())
+        self._save_session()
 
-            # --- Go to upload page ---
-            page.goto(UPLOAD_URL, wait_until="domcontentloaded")
-            time.sleep(3)
+    # ─────────────────────────────────────────────
+    #  File upload
+    # ─────────────────────────────────────────────
 
-            # --- Select file ---
-            print(f"  Uploading file: {os.path.basename(video_path)}")
-            file_uploaded = False
-            for sel in SELECTORS["upload_file"]:
-                try:
-                    page.locator(sel).first.wait_for(state="attached", timeout=15000)
-                    page.locator(sel).first.set_input_files(video_path)
-                    file_uploaded = True
-                    break
-                except Exception:
-                    continue
-            if not file_uploaded:
-                print("  ERROR: file input not found.")
-                _screenshot(page, "rumble_debug_upload")
-                return None
+    def _upload_file(self, video_path):
+        page = self.page
+        log('  Waiting for upload form...')
 
-            # Wait for the file to process and the form to appear
-            print("  Waiting for upload form...")
-            time.sleep(10)
-            try:
-                page.wait_for_load_state("networkidle", timeout=45000)
-            except Exception:
-                pass
-            
-            # Wait for upload progress to complete (look for progress indicators)
-            print("  Waiting for upload to complete...")
-            for _ in range(30):  # Wait up to 30 seconds for upload to complete
-                try:
-                    # Check if upload progress is still showing
-                    progress = page.locator("[class*=progress], [class*=uploading], text=Uploading, text=100%")
-                    if progress.count() == 0:
-                        break
-                    # Check if any progress text shows 100%
-                    content = page.content()
-                    if "100%" in content or "complete" in content.lower():
-                        break
-                except Exception:
-                    pass
-                time.sleep(1)
-            time.sleep(3)  # Extra wait after upload completes
-            
-            # --- Fill title (Rumble limit is 100 chars) ---
-            if not try_fill(page, SELECTORS["upload_title"], title[:100], description="title"):
-                print("  ! Title field not found - trying to continue.")
+        file_input = page.locator('input[name=Filedata]')
+        file_input.wait_for(state='attached', timeout=30_000)
 
-            # --- Fill description ---
-            if description:
-                if not try_fill(page, SELECTORS["upload_description"], description, description="description"):
-                    print("  ! Description field not found - trying to continue.")
+        file_input.set_input_files(str(video_path))
+        log(f'  File selected: {Path(video_path).name}')
 
-            # --- Fill tags ---
-            if tags:
-                if not try_fill(page, SELECTORS["upload_tags"], tags, description="tags"):
-                    print("  ! Tags field not found - trying to continue.")
+        log('  Waiting for upload to complete...')
+        self._wait_for_upload_complete()
 
-            # --- Set visibility to public ---
-            try_click(page, SELECTORS["visibility_public"], timeout=8000, description="public visibility")
+    def _wait_for_upload_complete(self):
+        page = self.page
 
-            # --- Pick a category (required; publish is blocked without it) ---
-            _select_category(page, term="podcast")
-
-            # --- Upload thumbnail (optional, guarded) ---
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                _set_thumbnail(page, thumbnail_path)
-
-            # --- Publish ---
-            print("  Looking for publish button...")
-            _dump_interactive(page, "before-publish")
-            _screenshot(page, "rumble_before_publish")
-            if _click_publish(page):
-                print("  Publish clicked - waiting for processing...")
-                time.sleep(4)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=30000)
-                except Exception:
-                    pass
-                time.sleep(2)
-
-                # Rumble shows a licensing/ToS agreement step after the first click.
-                # Tick the required boxes, then click the submit control again.
-                _accept_terms(page)
-                try:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                except Exception:
-                    pass
-                time.sleep(1)
-                _click_publish(page)
-                print("  Final submit clicked - waiting for processing...")
-                time.sleep(5)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=45000)
-                except Exception:
-                    pass
-                time.sleep(3)
-
-                # Wait for redirect to the video page
-                # Rumble video URLs look like https://rumble.com/vXXXXX-title-slug.html
-                # (NOT "/video/", so use a regex matching the video ID + slug dash.
-                # "videos" (listing) is excluded because it has no dash after the v.)
-                video_url_re = re.compile(r"rumble\.com/v[a-zA-Z0-9]+-")
-                try:
-                    page.wait_for_url(
-                        lambda url: bool(video_url_re.search(url)), timeout=45000
-                    )
-                except Exception:
-                    pass
-
-                url = page.url
-                if url and video_url_re.search(url):
-                    _screenshot(page, "rumble_after_publish")
-                    print("  Upload confirmed. URL:", url)
-                    return url
-
-            # If we got here, we can't confirm success. Diagnose the form state.
-            _dump_interactive(page, "upload-form")
-            _screenshot(page, "rumble_after_publish")
-            for marker in ["Video uploaded", "upload successful", "successfully", "has been uploaded"]:
-                if page.locator(f"text={marker}").count() > 0:
-                    print(f"  Success marker found: {marker}")
-                    return page.url or None
-
-            print("  WARNING: Could not confirm success. Check rumble_after_publish.png")
-            return None
-
-        finally:
-            try:
-                context.close()
-                browser.close()
-            except Exception:
-                pass
-    finally:
+        # Wait for 100% indicator
         try:
-            playwright.stop()
-        except Exception:
-            pass
-
-
-def _screenshot(page, name):
-    """Save a screenshot for debugging."""
-    try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.png")
-        page.screenshot(path=path)
-        print(f"  Screenshot saved: {path}")
-    except Exception:
-        pass
-
-
-def interactive_login():
-    """One-time interactive login. Saves session for future use."""
-    print("=" * 60)
-    print("RUMBLE ONE-TIME LOGIN")
-    print("Sign in to Rumble in the browser window, then close it.")
-    print("Your session will be saved to rumble_session.json")
-    print("=" * 60)
-
-    pw = get_playwright()
-    playwright = pw.start()
-    try:
-        browser = _launch_browser(playwright, headed=True)
-        context = browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900})
-        page = context.new_page()
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-        print("\nWaiting for you to log in... (browser is open)")
-        print("You have 5 minutes. Close the browser window when done.")
-
-        # Wait until user closes the browser or navigates away from /login
-        deadline = time.time() + 300
-        logged_in = False
-        browser_open = True
-        while time.time() < deadline and browser_open:
+            page.wait_for_selector(
+                '.num_percent:has-text("100%")',
+                timeout=UPLOAD_COMPLETE_TIMEOUT,
+            )
+            log('  Upload reached 100%.')
+        except PlaywrightTimeoutError:
+            # Fallback: check progress bar width
             try:
-                if "/login" not in page.url:
-                    logged_in = True
-                    print("  Login detected!")
-                    break
-            except Exception:
-                pass
-            try:
-                page.wait_for_event("close", timeout=2000)
-                print("  Browser window closed.")
-                browser_open = False
-            except Exception:
-                continue
+                page.wait_for_function(
+                    """() => {
+                        const el = document.querySelector('.green_percent');
+                        return el && el.style.width === '100%';
+                    }""",
+                    timeout=UPLOAD_COMPLETE_TIMEOUT,
+                )
+                log('  Upload reached 100% (via progress bar).')
+            except PlaywrightTimeoutError:
+                log('  WARNING: Upload completion could not be confirmed via UI. Continuing...')
 
-        if browser_open:
-            if not logged_in:
-                print("  Note: could not confirm login. Saving whatever session exists.")
-            try:
-                save_session(context.storage_state())
-                print("Session saved. Uploads are now fully automatic.")
-            except Exception as e:
-                print(f"Could not save session: {e}")
+        # Extra wait for server-side processing
+        time.sleep(3)
+
+    # ─────────────────────────────────────────────
+    #  Metadata
+    # ─────────────────────────────────────────────
+
+    def _fill_metadata(self, title, description, tags, category_value):
+        page = self.page
+
+        # Title
+        page.fill('input[name=title]', title)
+        log(f'  Title set: {title}')
+
+        # Description
+        page.fill('textarea[name=description]', description)
+        log(f'  Description set ({len(description)} chars)')
+
+        # Tags
+        page.fill('input[name=tags]', tags)
+        log(f'  Tags set: {tags}')
+
+        # Category (custom select widget)
+        self._select_category(category_value)
+
+        # Visibility: Public
+        public_radio = page.locator('input[name=visibility][value=public]')
+        if public_radio.count() > 0 and not public_radio.first.is_checked():
+            public_radio.first.check()
+        log('  Visibility set: public')
+
+    def _select_category(self, category_value):
+        page = self.page
+
+        # Click the search input to open the dropdown
+        search_input = page.locator('input[name=primary-category]')
+        search_input.click()
+        time.sleep(0.5)
+
+        # Find and click the matching option
+        option = page.locator(f'.select-option[data-value="{category_value}"]')
+        if option.count() > 0:
+            label = option.first.get_attribute('data-label') or '(unknown)'
+            option.first.click()
+            log(f'  Category set: {label} (value={category_value})')
         else:
-            print("  Session NOT saved (browser closed before login completed).")
-            print("  Re-run: python rumble_upload.py --login")
+            log.warning(f'  Category option {category_value} not found in dropdown.')
+            # Try setting the hidden value directly
+            page.evaluate(
+                f"document.getElementById('category_primary').value = '{category_value}';"
+            )
+            log(f'  Category value set directly: {category_value}')
 
+        time.sleep(0.3)
+
+    # ─────────────────────────────────────────────
+    #  Thumbnail
+    # ─────────────────────────────────────────────
+
+    def _set_thumbnail(self, thumbnail_path):
+        page = self.page
+        thumb_path = Path(thumbnail_path).resolve()
+
+        if not thumb_path.exists():
+            log(f'  Thumbnail not found: {thumb_path} — skipping.')
+            return
+
+        # Click "or choose your own" to reveal custom thumbnail upload
+        choose_own = page.locator('a.choose-your-own')
+        if choose_own.count() > 0:
+            choose_own.first.click()
+            time.sleep(0.5)
+
+        # Upload the thumbnail file
+        thumb_input = page.locator('input[name=customThumb]')
+        if thumb_input.count() > 0:
+            thumb_input.set_input_files(str(thumb_path))
+            log('  Thumbnail set.')
+            time.sleep(1)
+        else:
+            log('  WARNING: Could not find thumbnail file input.')
+
+    # ─────────────────────────────────────────────
+    #  Licensing  ← THIS WAS MISSING
+    # ─────────────────────────────────────────────
+
+    def _select_license(self):
+        """
+        Select the 'Rumble Only (non-exclusive, similar to YouTube)'
+        licensing option.
+
+        The licensing options on Rumble's upload form are <A> links,
+        NOT radio buttons.  You must click one before the form will
+        accept submission.
+
+        Available options:
+          - Video Management (exclusive)
+          - Video Management (excluding YouTube)
+          - Rumble Only (non-exclusive, similar to YouTube)   ← we pick this
+          - Personal Use (not monetized, not searchable)
+        """
+        page = self.page
+
+        # Try several selectors for the "Rumble Only" link
+        selectors = [
+            'a:has-text("Rumble Only")',
+            'a.greenLink:has-text("Rumble Only")',
+            'a:has-text("non-exclusive")',
+        ]
+
+        clicked = False
+        for sel in selectors:
+            link = page.locator(sel).first
+            if link.count() > 0 and link.is_visible():
+                link.click()
+                time.sleep(0.5)
+                log('  License selected: Rumble Only (non-exclusive, similar to YouTube)')
+                clicked = True
+                break
+
+        if not clicked:
+            log('  WARNING: Could not find licensing option "Rumble Only".')
+            log('           The form may not submit without a licensing selection.')
+
+    # ─────────────────────────────────────────────
+    #  Terms & Conditions  ← THIS WAS MISSING
+    # ─────────────────────────────────────────────
+
+    def _agree_to_terms(self):
+        """
+        Check the Terms-of-Service checkboxes.
+
+        There are two checkboxes with name='crights':
+          1. "You have not signed an exclusive agreement with any other parties."
+          2. "Check here if you agree to our terms of service."
+
+        BOTH must be checked or the form will not submit.
+        """
+        page = self.page
+
+        crights = page.locator('input[name=crights]')
+        count = crights.count()
+
+        if count == 0:
+            log('  WARNING: No terms checkboxes (input[name=crights]) found.')
+            return
+
+        for i in range(count):
+            checkbox = crights.nth(i)
+            if not checkbox.is_checked():
+                checkbox.check()
+                time.sleep(0.3)
+
+        log(f'  Terms agreed ({count} checkbox{"es" if count != 1 else ""} checked).')
+
+    # ─────────────────────────────────────────────
+    #  Publish
+    # ─────────────────────────────────────────────
+
+    def _publish(self):
+        """
+        Click the submit button and verify success.
+
+        The submit button on Rumble's upload form is:
+          <input type="button" id="submitForm"
+                 class="submit_content button-small update-btn"
+                 value="Upload">
+
+        Note: the button text is "Upload", NOT "Publish".
+        After a successful submit, Rumble redirects to a media
+        management page.
+        """
+        page = self.page
+
+        # Locate the submit button by ID (most reliable)
+        submit_btn = page.locator('#submitForm')
+
+        # Fallback selectors if ID is not found
+        if submit_btn.count() == 0:
+            fallbacks = [
+                'input.submit_content',
+                'input.update-btn',
+                'input[type=button][value=Upload]',
+                'button:has-text("Upload")',
+            ]
+            for sel in fallbacks:
+                btn = page.locator(sel).first
+                if btn.count() > 0:
+                    submit_btn = btn
+                    log(f'  Found submit button via fallback: {sel}')
+                    break
+
+        if submit_btn.count() == 0:
+            log('  ! Could not find submit button')
+            self._dump_debug()
+            return False
+
+        # Check if disabled
+        disabled = submit_btn.first.get_attribute('disabled')
+        if disabled is not None:
+            log('  ! Submit button is DISABLED — a required field may be missing.')
+            self._dump_debug()
+            return False
+
+        # Click it
+        log('  Clicking submit button (id=submitForm, value=Upload)...')
+        submit_btn.first.click()
+
+        # ── Wait for success ──
+        # After successful publish, Rumble redirects away from /upload.php
         try:
-            context.close()
-            browser.close()
+            page.wait_for_url(
+                lambda url: 'upload.php' not in url,
+                timeout=PUBLISH_REDIRECT_TIMEOUT,
+            )
+            log(f'  Publish confirmed — redirected to: {page.url}')
+            return True
+        except PlaywrightTimeoutError:
+            pass
+
+        # Fallback: check for success indicators on the current page
+        success_selectors = [
+            'text=successfully',
+            'text=upload complete',
+            'text=video has been',
+            '.media-published',
+            '.success-message',
+        ]
+        for sel in success_selectors:
+            if page.locator(sel).count() > 0:
+                log(f'  Publish confirmed — success indicator found: {sel}')
+                return True
+
+        log('  ! Could not confirm publish success.')
+        self._dump_debug()
+        return False
+
+    # ─────────────────────────────────────────────
+    #  Debug dump (on failure)
+    # ─────────────────────────────────────────────
+
+    def _dump_debug(self):
+        """Dump page state for debugging when something goes wrong."""
+        page = self.page
+        log('  --- DEBUG DUMP ---')
+
+        # Current URL
+        log(f'  Current URL: {page.url}')
+
+        # All buttons
+        buttons = page.locator('button, input[type=button], input[type=submit]').all()
+        log(f'  Buttons on page: {len(buttons)}')
+        for i, btn in enumerate(buttons):
+            try:
+                outer = btn.evaluate('el => el.outerHTML.slice(0, 200)')
+                log(f'    [{i}] {outer}')
+            except Exception:
+                pass
+
+        # Validation errors
+        errors = page.locator('.error, [class*=error], .invalid, [class*=invalid]').all()
+        log(f'  Error elements: {len(errors)}')
+        for i, err in enumerate(errors):
+            try:
+                txt = err.text_content()
+                if txt and txt.strip():
+                    log(f'    [error {i}] {txt.strip()[:200]}')
+            except Exception:
+                pass
+
+        # Checkboxes state
+        checkboxes = page.locator('input[type=checkbox]').all()
+        log(f'  Checkboxes: {len(checkboxes)}')
+        for i, cb in enumerate(checkboxes):
+            try:
+                name = cb.get_attribute('name') or '(no name)'
+                checked = cb.is_checked()
+                log(f'    [checkbox {i}] name={name} checked={checked}')
+            except Exception:
+                pass
+
+        # Save full HTML
+        try:
+            html_path = Path('rumble_debug_page.html')
+            html_path.write_text(page.content())
+            log(f'  Full HTML saved: {html_path.resolve()}')
         except Exception:
             pass
-    finally:
-        playwright.stop()
+
+        log('  --- END DEBUG DUMP ---')
+
+    # ─────────────────────────────────────────────
+    #  Main upload orchestration
+    # ─────────────────────────────────────────────
+
+    def upload(self, video_path, title, description, tags,
+               category_value=DEFAULT_CATEGORY_VALUE,
+               thumbnail_path=None):
+        """
+        Full upload pipeline:
+          1. Login / restore session
+          2. Upload video file
+          3. Fill metadata (title, description, tags, category, visibility)
+          4. Set thumbnail
+          5. Select licensing option     ← was missing
+          6. Agree to terms of service   ← was missing
+          7. Click publish button
+          8. Verify success
+        """
+        video_path = Path(video_path).resolve()
+        if not video_path.exists():
+            raise FileNotFoundError(f'Video not found: {video_path}')
+
+        log()
+        log('============================================================')
+        log('RUMBLE UPLOAD')
+        log('============================================================')
+
+        # 1. Login / restore session
+        self._ensure_logged_in()
+
+        # 2. Upload video file
+        log(f'  Uploading file: {video_path.name}')
+        self._upload_file(video_path)
+
+        # 3. Fill metadata
+        self._fill_metadata(title, description, tags, category_value)
+
+        # 4. Set thumbnail
+        if thumbnail_path:
+            self._set_thumbnail(thumbnail_path)
+        else:
+            log('  No thumbnail provided — skipping.')
+
+        # 5. Select licensing option
+        self._select_license()
+
+        # 6. Agree to terms
+        self._agree_to_terms()
+
+        # Small delay to let any JS/HTMX state settle
+        time.sleep(1)
+
+        # 7. Pre-publish screenshot
+        self.page.screenshot(path=SCREENSHOT_BEFORE, full_page=True)
+        log(f'  Screenshot saved: {Path(SCREENSHOT_BEFORE).resolve()}')
+
+        # 8. Publish
+        success = self._publish()
+
+        # 9. Post-publish screenshot
+        self.page.screenshot(path=SCREENSHOT_AFTER, full_page=True)
+        log(f'  Screenshot saved: {Path(SCREENSHOT_AFTER).resolve()}')
+
+        if not success:
+            raise RuntimeError(
+                'Could not confirm publish success. '
+                f'Check {SCREENSHOT_AFTER} and rumble_debug_page.html'
+            )
+
+        log()
+        log('============================================================')
+        log('RUMBLE UPLOAD COMPLETE ✓')
+        log('============================================================')
+        log(f'  Video URL: {self.page.url}')
+        log()
 
 
-def build_description(episode_title):
-    return DEFAULT_DESCRIPTION.replace("Cat Podcast with Simba and Meow", f"Cat Podcast with Simba and Meow - {episode_title}")
+# ═════════════════════════════════════════════════════════════
+#  CLI entry point
+# ═════════════════════════════════════════════════════════════
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Upload videos to Rumble automatically.")
-    parser.add_argument("--login", action="store_true", help="One-time interactive login")
-    parser.add_argument("--video", help="Path to video file")
-    parser.add_argument("--title", help="Video title")
-    parser.add_argument("--description", help="Video description")
-    parser.add_argument("--tags", help="Comma-separated tags")
-    parser.add_argument("--thumbnail", help="Path to thumbnail image")
-    parser.add_argument("--headed", action="store_true", help="Run browser visible (debugging)")
-
+def main():
+    parser = argparse.ArgumentParser(
+        description='Upload a video to Rumble.com'
+    )
+    parser.add_argument('video', help='Path to the video file')
+    parser.add_argument('--title',       help='Video title')
+    parser.add_argument('--description', help='Video description')
+    parser.add_argument('--tags',        help='Comma-separated tags')
+    parser.add_argument('--category',    default=DEFAULT_CATEGORY_VALUE,
+                        help=f'Rumble category data-value (default: {DEFAULT_CATEGORY_VALUE})')
+    parser.add_argument('--thumbnail',   help='Path to thumbnail image')
+    parser.add_argument('--headed', action='store_true',
+                        help='Run with visible browser (for debugging)')
     args = parser.parse_args()
 
-    if args.login:
-        interactive_login()
-        sys.exit(0)
+    # Load metadata from directory if individual fields are missing
+    meta = find_metadata(args.video)
+    title       = args.title       or meta['title']
+    description = args.description or meta['description']
+    tags        = args.tags        or meta['tags']
+    category    = args.category    or meta['category']
+    thumbnail   = args.thumbnail   or meta['thumbnail']
 
-    if not args.video:
-        print("Usage:")
-        print("  python rumble_upload.py --login                    # one-time setup")
-        print("  python rumble_upload.py --video v.mp4 --title T    # upload")
+    # Validate credentials
+    if not RUMBLE_EMAIL or not RUMBLE_PASSWORD:
+        log('ERROR: RUMBLE_EMAIL and RUMBLE_PASSWORD environment variables are required.')
         sys.exit(1)
 
-    url = upload_video(
-        video_path=args.video,
-        title=args.title or "Cat Podcast Episode",
-        description=args.description or build_description(args.title or ""),
-        tags=args.tags or DEFAULT_TAGS,
-        thumbnail_path=args.thumbnail,
-        headed=args.headed,
-    )
+    log(f'Uploading: {args.video}')
 
-    if url:
-        print(f"\nRUMBLE URL: {url}")
-    else:
-        print("\nRUMBLE UPLOAD FAILED")
+    # Run
+    uploader = RumbleUploader(headless=not args.headed)
+    try:
+        uploader.start()
+        uploader.upload(
+            video_path=args.video,
+            title=title,
+            description=description,
+            tags=tags,
+            category_value=category,
+            thumbnail_path=thumbnail,
+        )
+    except Exception as e:
+        log()
+        log('============================================================')
+        log('RUMBLE UPLOAD FAILED')
+        log('============================================================')
+        log(f'Error: {e}')
+        # Save failure screenshot
+        if uploader.page:
+            try:
+                uploader.page.screenshot(path=SCREENSHOT_AFTER, full_page=True)
+                log(f'Screenshot saved: {Path(SCREENSHOT_AFTER).resolve()}')
+            except Exception:
+                pass
         sys.exit(1)
+    finally:
+        uploader.stop()
+
+
+if __name__ == '__main__':
+    main()
