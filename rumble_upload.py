@@ -3,11 +3,11 @@
 rumble_upload.py — Automated video upload to Rumble.com
 
 Usage:
-    python rumble_upload.py <video_path> [--thumbnail <path>] [--title <title>] ...
+    python rumble_upload.py --video <video_path> [--thumbnail <path>] [--title <title>] ...
 
 Environment variables:
     RUMBLE_EMAIL     — Rumble account email/username
-    RUMBLE_PASSWORD   — Rumble account password
+    RUMBLE_PASSWORD  — Rumble account password
 
 If --title, --description, --tags are omitted, the script looks for
 metadata.json in the same directory as the video file.
@@ -660,7 +660,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Upload a video to Rumble.com'
     )
-    parser.add_argument('video', help='Path to the video file')
+    # FIX: Added '--video' flag with required=True so it matches your workflow command
+    parser.add_argument('--video', required=True, help='Path to the video file')
     parser.add_argument('--title',       help='Video title')
     parser.add_argument('--description', help='Video description')
     parser.add_argument('--tags',        help='Comma-separated tags')
