@@ -16,6 +16,7 @@ import json
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from stickman_cats import create_animation_frames
 
 VOICE_SPEAKER1 = "en-US-ChristopherNeural"  # Simba
 VOICE_SPEAKER2 = "en-US-JennyNeural"        # Meow
@@ -23,6 +24,7 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 TTS_CONCURRENCY = 5
 TTS_MAX_RETRIES = 3
+ANIMATION_FPS = 24
 
 
 def ensure_dir(path):
@@ -116,31 +118,26 @@ def sanitize_drawtext(text):
 
 
 def make_thumbnail(title, out_path):
-    """Simple thumbnail with ffmpeg. Falls back to a plain color image
-    if text rendering is unavailable (e.g. no fonts on the runner)."""
-    safe_title = sanitize_drawtext(title[:40])
+    """Generate thumbnail with stickman cats. Falls back to a plain color image
+    if animation generation fails."""
     try:
-        cmd = [
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=#1a1a2e:s=1280x720:d=1",
-            "-vf", (
-                "drawtext=text='Cat Podcast':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=h/2-80,"
-                f"drawtext=text='{safe_title}':fontcolor=#ffaa00:fontsize=40:x=(w-text_w)/2:y=h/2+20"
-            ),
-            "-frames:v", "1", out_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            print(f"  ! Thumbnail text ffmpeg stderr: {result.stderr[:200]}")
-        elif os.path.exists(out_path):
+        from stickman_cats import PodcastScene
+
+        scene = PodcastScene(width=1280, height=720)
+        img = scene.generate_frame("Speaker 1", 0.0, 0)
+        img.save(out_path, "PNG")
+
+        if os.path.exists(out_path):
+            print("  Thumbnail generated with stickman cats.")
             return out_path
     except Exception as e:
-        print(f"  ! Thumbnail text generation failed: {e}")
+        print(f"  ! Thumbnail animation failed: {e}")
 
     # Fallback: plain color thumbnail (valid PNG, no text needed)
     try:
         plain = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=#1a1a2e:s=1280x720:d=1",
-            "-frames:v", "1", out_path,
+            "-frames:v", "1", "-q:v", "2", out_path,
         ]
         result = subprocess.run(plain, capture_output=True, text=True, timeout=30)
         if result.returncode == 0 and os.path.exists(out_path):
@@ -199,7 +196,7 @@ def main(script_path, episode_title=None):
             f.write(f"file '{p.replace(os.sep, '/')}'\n")
     raw_audio = os.path.join(out_dir, "raw_audio.mp3")
     if not run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
-                       "-c:a", "libmp3lame", raw_audio], timeout=300):
+                       "-c:a", "libmp3lame", "-q:a", "2", raw_audio], timeout=300):
         print("ERROR: audio concat failed")
         sys.exit(1)
 
@@ -208,24 +205,69 @@ def main(script_path, episode_title=None):
     srt_path = os.path.join(out_dir, "subtitles.srt")
     make_srt(lines, durations, srt_path)
 
-    # 4. Build video (duration from the actual concatenated audio)
+    # 4. Build video with animated stickman cats (duration from the actual concatenated audio)
     total_dur = get_audio_duration(raw_audio)
     video_path = os.path.join(out_dir, "final_video.mp4")
-    # Use a relative SRT path with cwd=out_dir. Absolute paths with Windows
-    # drive letters (C\:) break the subtitles= filter option parsing.
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c=#1a1a2e:s=1280x720:d={total_dur}",
-        "-i", raw_audio,
-        "-vf", "subtitles=subtitles.srt:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
-        "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
-        "-shortest", video_path,
-    ]
-    print("Building video...")
-    if not run_ffmpeg(cmd, timeout=600, cwd=out_dir):
-        print("ERROR: video generation failed")
-        sys.exit(1)
+
+    print("Generating stickman cat animations...")
+    try:
+        # Generate animation frames
+        frame_paths = create_animation_frames(lines, durations, seg_dir, fps=ANIMATION_FPS)
+
+        if not frame_paths:
+            print("ERROR: No animation frames generated, falling back to static background")
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c=#1a1a2e:s=1280x720:d={total_dur}",
+                "-i", raw_audio,
+                "-vf", "subtitles=subtitles.srt:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-shortest", video_path,
+            ]
+            if not run_ffmpeg(cmd, timeout=600, cwd=out_dir):
+                print("ERROR: video generation failed")
+                sys.exit(1)
+        else:
+            # Create video from frames
+            frames_dir = os.path.join(seg_dir, "animation_frames")
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(ANIMATION_FPS),
+                "-i", os.path.join(frames_dir, "frame_%06d.png"),
+                "-i", raw_audio,
+                "-vf", "subtitles=subtitles.srt:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-shortest", video_path,
+            ]
+            if not run_ffmpeg(cmd, timeout=600, cwd=out_dir):
+                print("ERROR: video generation failed")
+                sys.exit(1)
+
+            # Cleanup animation frames to save disk space
+            import shutil
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            print("Animation frames cleaned up")
+
+    except Exception as e:
+        print(f"ERROR: Animation generation failed: {e}")
+        print("Falling back to static background...")
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=#1a1a2e:s=1280x720:d={total_dur}",
+            "-i", raw_audio,
+            "-vf", "subtitles=subtitles.srt:force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=40'",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-shortest", video_path,
+        ]
+        if not run_ffmpeg(cmd, timeout=600, cwd=out_dir):
+            print("ERROR: video generation failed")
+            sys.exit(1)
 
     # 5. Thumbnail
     thumb_path = make_thumbnail(episode_title, os.path.join(out_dir, "thumbnail.png"))

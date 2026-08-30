@@ -18,50 +18,164 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg (static binary, avoids apt)
+      - name: Install FFmpeg (with fallbacks)
         run: |
-          ffmpeg -version >/dev/null 2>&1 && echo "ffmpeg already present" && ffmpeg -version | head -1 || {
-            cd /tmp
-            curl -sSL -o ffmpeg.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          # Strategy 1: Check if already installed
+          if command -v ffmpeg &> /dev/null; then
+            echo "ffmpeg already present"
+            ffmpeg -version | head -1
+            exit 0
+          fi
+
+          # Strategy 2: Install via apt (most reliable on Ubuntu runners)
+          echo "Installing ffmpeg via apt..."
+          if sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; then
+            echo "ffmpeg installed via apt"
+            ffmpeg -version | head -1
+            exit 0
+          fi
+
+          # Strategy 3: Download static build from GitHub (BtbN builds)
+          echo "apt failed, trying static build from GitHub..."
+          cd /tmp
+          STATIC_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          if curl -sSL -o ffmpeg.tar.xz "$STATIC_URL" && tar xf ffmpeg.tar.xz; then
+            FF=$(find /tmp -maxdepth 2 -name ffmpeg -type f | head -1)
+            if [ -n "$FF" ]; then
+              sudo cp "$FF" /usr/local/bin/ffmpeg
+              sudo chmod +x /usr/local/bin/ffmpeg
+              echo "ffmpeg installed from static build"
+              ffmpeg -version | head -1
+              exit 0
+            fi
+          fi
+
+          # Strategy 4: Try johnvansickle (original source)
+          echo "GitHub static failed, trying johnvansickle..."
+          if curl -sSL -o ffmpeg.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" && \
+             file ffmpeg.tar.xz | grep -q "XZ"; then
             tar xf ffmpeg.tar.xz
             FF=$(find /tmp -maxdepth 2 -name ffmpeg -type f | head -1)
-            sudo cp "$FF" /usr/local/bin/ffmpeg
-            ffmpeg -version | head -1
-          }
+            if [ -n "$FF" ]; then
+              sudo cp "$FF" /usr/local/bin/ffmpeg
+              sudo chmod +x /usr/local/bin/ffmpeg
+              echo "ffmpeg installed from johnvansickle"
+              ffmpeg -version | head -1
+              exit 0
+            fi
+          fi
+
+          echo "ERROR: All FFmpeg installation methods failed"
+          exit 1
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Install Playwright Chromium
         run: |
-          # GitHub ubuntu runners already ship Playwright OS dependencies,
-          # so only the browser binary is needed. Retry in case of CDN flakiness.
-          for i in 1 2 3; do
-            python -m playwright install chromium && break
-            echo "playwright install attempt $i failed, retrying..."
+          # Retry logic for Playwright installation
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Playwright install attempt $i of $MAX_RETRIES..."
+            if python -m playwright install chromium; then
+              echo "Playwright installed successfully"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 5 seconds..."
             sleep 5
           done
-          python -m playwright install chromium
+          echo "ERROR: Playwright installation failed after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Validate scripts directory
+        run: |
+          if [ ! -d "scripts" ] || [ -z "$(ls scripts/*.txt 2>/dev/null)" ]; then
+            echo "ERROR: No scripts found in scripts/ directory"
+            exit 1
+          fi
+          echo "Available scripts:"
+          ls -la scripts/*.txt
 
       - name: Generate episode video (rotating scripts)
         run: |
           mkdir -p output
-          SCRIPTS=$(ls scripts/*.txt)
-          COUNT=$(echo "$SCRIPTS" | wc -l)
-          INDEX=$(( ( $(date +%j) % COUNT ) ))
-          SCRIPT=$(echo "$SCRIPTS" | sed -n "$((INDEX + 1))p")
-          echo "Selected script: $SCRIPT"
+          SCRIPTS=(scripts/*.txt)
+          COUNT=${#SCRIPTS[@]}
+          
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: No script files found"
+            exit 1
+          fi
+          
+          # Use day of year for rotation
+          DAY_OF_YEAR=$(date +%j)
+          INDEX=$(( DAY_OF_YEAR % COUNT ))
+          SCRIPT="${SCRIPTS[$INDEX]}"
+          
+          echo "Selected script: $SCRIPT (index $INDEX of $COUNT scripts)"
           python generate_video.py "$SCRIPT"
+
+      - name: Validate generated files
+        run: |
+          # Find the most recent episode directory
+          EPISODE_DIR=$(find output -maxdepth 1 -type d -name "episode_*" | sort | tail -1)
+          
+          if [ -z "$EPISODE_DIR" ]; then
+            echo "ERROR: No episode directory found"
+            exit 1
+          fi
+          
+          echo "Episode directory: $EPISODE_DIR"
+          
+          # Check for required files
+          if [ ! -f "$EPISODE_DIR/final_video.mp4" ]; then
+            echo "ERROR: final_video.mp4 not found"
+            exit 1
+          fi
+          
+          if [ ! -f "$EPISODE_DIR/thumbnail.png" ]; then
+            echo "WARNING: thumbnail.png not found, will upload without thumbnail"
+          fi
+          
+          # Print file sizes
+          ls -lh "$EPISODE_DIR/"
+          
+          # Verify video is valid
+          ffprobe -v error -show_format -show_streams "$EPISODE_DIR/final_video.mp4" > /dev/null 2>&1 || {
+            echo "ERROR: Generated video is corrupted or invalid"
+            exit 1
+          }
+          
+          echo "Generated files validated successfully"
 
       - name: Upload to Rumble
         env:
           RUMBLE_EMAIL: ${{ secrets.RUMBLE_EMAIL }}
           RUMBLE_PASSWORD: ${{ secrets.RUMBLE_PASSWORD }}
         run: |
-          VIDEO=$(find output -name 'final_video.mp4' | sort | tail -1)
-          THUMB=$(find output -name 'thumbnail.png' | sort | tail -1)
+          # Find the most recent episode
+          EPISODE_DIR=$(find output -maxdepth 1 -type d -name "episode_*" | sort | tail -1)
+          VIDEO="$EPISODE_DIR/final_video.mp4"
+          THUMB="$EPISODE_DIR/thumbnail.png"
+          
+          if [ ! -f "$VIDEO" ]; then
+            echo "ERROR: Video file not found: $VIDEO"
+            exit 1
+          fi
+          
           echo "Uploading: $VIDEO"
-          python rumble_upload.py --video "$VIDEO" --title "Cat Podcast Episode - $(date +%Y-%m-%d)" --thumbnail "$THUMB"
+          echo "Thumbnail: $THUMB"
+          
+          # Build upload command
+          UPLOAD_CMD="python rumble_upload.py --video \"$VIDEO\" --title \"Cat Podcast Episode - $(date +%Y-%m-%d)\""
+          
+          if [ -f "$THUMB" ]; then
+            UPLOAD_CMD="$UPLOAD_CMD --thumbnail \"$THUMB\""
+          fi
+          
+          eval $UPLOAD_CMD
 
       - name: Upload artifacts
         if: always()
@@ -71,7 +185,22 @@ jobs:
           path: |
             output/episode_*/final_video.mp4
             output/episode_*/thumbnail.png
+            output/episode_*/metadata.json
             rumble_before_publish.png
             rumble_after_publish.png
             rumble_debug_*.png
-          retention-days: 7
+          retention-days: 14
+
+      - name: Cleanup old episodes (keep last 5)
+        if: always()
+        run: |
+          # Remove episode directories older than 5 runs to save disk space
+          EPISODES=$(find output -maxdepth 1 -type d -name "episode_*" | sort -r)
+          COUNT=0
+          for EP in $EPISODES; do
+            COUNT=$((COUNT + 1))
+            if [ $COUNT -gt 5 ]; then
+              echo "Removing old episode: $EP"
+              rm -rf "$EP"
+            fi
+          done
