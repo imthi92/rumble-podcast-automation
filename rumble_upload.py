@@ -131,7 +131,6 @@ class RumbleUploader:
                 '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             ),
             viewport={'width': 1280, 'height': 800},
-            accept_images=True,
         )
 
     # ─────────────────────────────────────────────
