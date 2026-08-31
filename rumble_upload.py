@@ -330,7 +330,7 @@ class RumbleUploader:
             option.first.click()
             log(f'  Category set: {label} (value={category_value})')
         else:
-            log.warning(f'  Category option {category_value} not found in dropdown.')
+            log(f'  WARNING: Category option {category_value} not found in dropdown.')
             # Try setting the hidden value directly
             page.evaluate(
                 f"document.getElementById('category_primary').value = '{category_value}';"
@@ -660,8 +660,9 @@ def main():
     parser = argparse.ArgumentParser(
         description='Upload a video to Rumble.com'
     )
-    # FIX: Added '--video' flag with required=True so it matches your workflow command
-    parser.add_argument('--video', required=True, help='Path to the video file')
+    parser.add_argument('--login', action='store_true',
+                        help='Perform interactive login and save session, then exit')
+    parser.add_argument('--video', help='Path to the video file')
     parser.add_argument('--title',       help='Video title')
     parser.add_argument('--description', help='Video description')
     parser.add_argument('--tags',        help='Comma-separated tags')
@@ -672,6 +673,30 @@ def main():
                         help='Run with visible browser (for debugging)')
     args = parser.parse_args()
 
+    # Validate credentials
+    if not RUMBLE_EMAIL or not RUMBLE_PASSWORD:
+        log('ERROR: RUMBLE_EMAIL and RUMBLE_PASSWORD environment variables are required.')
+        sys.exit(1)
+
+    # --login mode: just log in and save session
+    if args.login:
+        log('Login mode: logging in and saving session...')
+        uploader = RumbleUploader(headless=not args.headed)
+        try:
+            uploader.start()
+            uploader._ensure_logged_in()
+            log('Login successful. Session saved.')
+        except Exception as e:
+            log(f'Login failed: {e}')
+            sys.exit(1)
+        finally:
+            uploader.stop()
+        return
+
+    # --video is required for upload mode
+    if not args.video:
+        parser.error('--video is required (or use --login for login-only mode)')
+
     # Load metadata from directory if individual fields are missing
     meta = find_metadata(args.video)
     title       = args.title       or meta['title']
@@ -679,11 +704,6 @@ def main():
     tags        = args.tags        or meta['tags']
     category    = args.category    or meta['category']
     thumbnail   = args.thumbnail   or meta['thumbnail']
-
-    # Validate credentials
-    if not RUMBLE_EMAIL or not RUMBLE_PASSWORD:
-        log('ERROR: RUMBLE_EMAIL and RUMBLE_PASSWORD environment variables are required.')
-        sys.exit(1)
 
     log(f'Uploading: {args.video}')
 

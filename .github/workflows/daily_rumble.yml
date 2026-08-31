@@ -79,7 +79,7 @@ jobs:
           MAX_RETRIES=3
           for i in $(seq 1 $MAX_RETRIES); do
             echo "Playwright install attempt $i of $MAX_RETRIES..."
-            if python -m playwright install chromium; then
+            if python -m playwright install --with-deps chromium; then
               echo "Playwright installed successfully"
               exit 0
             fi
@@ -150,6 +150,14 @@ jobs:
           
           echo "Generated files validated successfully"
 
+      - name: Validate secrets
+        run: |
+          if [ -z "$RUMBLE_EMAIL" ] || [ -z "$RUMBLE_PASSWORD" ]; then
+            echo "ERROR: RUMBLE_EMAIL or RUMBLE_PASSWORD secrets not configured"
+            exit 1
+          fi
+          echo "Secrets validated OK"
+
       - name: Upload to Rumble
         env:
           RUMBLE_EMAIL: ${{ secrets.RUMBLE_EMAIL }}
@@ -168,14 +176,14 @@ jobs:
           echo "Uploading: $VIDEO"
           echo "Thumbnail: $THUMB"
           
-          # Build upload command
-          UPLOAD_CMD="python rumble_upload.py --video \"$VIDEO\" --title \"Cat Podcast Episode - $(date +%Y-%m-%d)\""
+          # Build upload command as array (safe for spaces/special chars)
+          CMD=(python rumble_upload.py --video "$VIDEO" --title "Cat Podcast Episode - $(date +%Y-%m-%d)")
           
           if [ -f "$THUMB" ]; then
-            UPLOAD_CMD="$UPLOAD_CMD --thumbnail \"$THUMB\""
+            CMD+=(--thumbnail "$THUMB")
           fi
           
-          eval $UPLOAD_CMD
+          "${CMD[@]}"
 
       - name: Upload artifacts
         if: always()
