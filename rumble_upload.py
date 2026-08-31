@@ -8,6 +8,8 @@ Usage:
 Environment variables:
     RUMBLE_EMAIL     — Rumble account email/username
     RUMBLE_PASSWORD  — Rumble account password
+    
+Note: Playwright 1.50.0 does not support accept_images parameter.
 
 If --title, --description, --tags are omitted, the script looks for
 metadata.json in the same directory as the video file.
