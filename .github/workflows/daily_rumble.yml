@@ -151,6 +151,9 @@ jobs:
           echo "Generated files validated successfully"
 
       - name: Validate secrets
+        env:
+          RUMBLE_EMAIL: ${{ secrets.RUMBLE_EMAIL }}
+          RUMBLE_PASSWORD: ${{ secrets.RUMBLE_PASSWORD }}
         run: |
           if [ -z "$RUMBLE_EMAIL" ] || [ -z "$RUMBLE_PASSWORD" ]; then
             echo "ERROR: RUMBLE_EMAIL or RUMBLE_PASSWORD secrets not configured"
