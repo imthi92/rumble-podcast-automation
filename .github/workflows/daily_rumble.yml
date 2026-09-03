@@ -154,9 +154,12 @@ jobs:
         env:
           RUMBLE_EMAIL: ${{ secrets.RUMBLE_EMAIL }}
           RUMBLE_PASSWORD: ${{ secrets.RUMBLE_PASSWORD }}
+          RUMBLE_COOKIES: ${{ secrets.RUMBLE_COOKIES }}
         run: |
-          if [ -z "$RUMBLE_EMAIL" ] || [ -z "$RUMBLE_PASSWORD" ]; then
-            echo "ERROR: RUMBLE_EMAIL or RUMBLE_PASSWORD secrets not configured"
+          if [ -n "$RUMBLE_COOKIES" ]; then
+            echo "RUMBLE_COOKIES secret found - will use cookie auth"
+          elif [ -z "$RUMBLE_EMAIL" ] || [ -z "$RUMBLE_PASSWORD" ]; then
+            echo "ERROR: Set RUMBLE_COOKIES secret (preferred) or RUMBLE_EMAIL + RUMBLE_PASSWORD"
             exit 1
           fi
           echo "Secrets validated OK"
@@ -165,6 +168,7 @@ jobs:
         env:
           RUMBLE_EMAIL: ${{ secrets.RUMBLE_EMAIL }}
           RUMBLE_PASSWORD: ${{ secrets.RUMBLE_PASSWORD }}
+          RUMBLE_COOKIES: ${{ secrets.RUMBLE_COOKIES }}
         run: |
           # Find the most recent episode
           EPISODE_DIR=$(find output -maxdepth 1 -type d -name "episode_*" | sort | tail -1)

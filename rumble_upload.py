@@ -29,6 +29,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 RUMBLE_EMAIL    = os.environ.get('RUMBLE_EMAIL', '')
 RUMBLE_PASSWORD = os.environ.get('RUMBLE_PASSWORD', '')
+RUMBLE_COOKIES  = os.environ.get('RUMBLE_COOKIES', '')
 
 LOGIN_URL    = 'https://auth.rumble.com/?theme=s&redirect_uri=https%3A%2F%2Frumble.com%2F&lang=en_US'
 UPLOAD_URL   = 'https://rumble.com/upload.php'
@@ -180,7 +181,26 @@ class RumbleUploader:
         page = self.page
 
         page.goto(LOGIN_URL, wait_until='networkidle')
-        time.sleep(2)
+        time.sleep(3)
+
+        log(f'    [login-page] URL: {page.url}')
+        log(f'    [login-page] Title: {page.title()}')
+
+        # Detect Cloudflare Turnstile challenge
+        if 'just a moment' in page.title().lower() or 'cloudflare' in page.content().lower():
+            log('    [login-page] Cloudflare Turnstile detected. Waiting for challenge to complete...')
+            try:
+                page.wait_for_function(
+                    """() => !document.title.toLowerCase().includes('just a moment')""",
+                    timeout=60_000,
+                )
+                log('    [login-page] Cloudflare challenge passed!')
+                time.sleep(2)
+            except PlaywrightTimeoutError:
+                log('    [login-page] ERROR: Cloudflare Turnstile blocked the login.')
+                log('    [login-page] SOLUTION: Store session cookies as GitHub secret RUMBLE_COOKIES')
+                log('    [login-page] See: https://github.com/imthi92/rumble-podcast-automation#cookie-auth')
+                return False
 
         log(f'    [login-page] URL: {page.url}')
         log(f'    [login-page] Title: {page.title()}')
@@ -224,6 +244,21 @@ class RumbleUploader:
 
     def _ensure_logged_in(self):
         """Restore session or log in fresh."""
+        # Try environment cookies first (from GitHub secret)
+        if RUMBLE_COOKIES:
+            log('  Loading cookies from RUMBLE_COOKIES env...')
+            try:
+                cookies = json.loads(RUMBLE_COOKIES)
+                if isinstance(cookies, list):
+                    self.context.add_cookies(cookies)
+                    log(f'  Loaded {len(cookies)} cookies from env.')
+                elif isinstance(cookies, dict) and 'cookies' in cookies:
+                    self.context.add_cookies(cookies['cookies'])
+                    log(f'  Loaded {len(cookies["cookies"])} cookies from env.')
+            except Exception as e:
+                log(f'  [cookies] Failed to load env cookies: {e}')
+
+        # Try saved session file
         if self._has_saved_session():
             log('  Restoring saved session...')
             self._restore_session()
