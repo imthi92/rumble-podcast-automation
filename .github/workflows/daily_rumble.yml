@@ -3,6 +3,8 @@ name: Daily Rumble Podcast
 on:
   schedule:
     - cron: '0 11 * * *'
+  # Manual trigger
+  workflow_dispatch:
   workflow_dispatch:
 
 jobs:
