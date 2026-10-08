@@ -274,23 +274,40 @@ class RumbleUploader:
 
         if self._is_logged_in():
             log('  Session is valid.')
-        elif cookies_loaded:
-            # Cookies were loaded but session is invalid — don't retry login
-            # (Cloudflare will block it anyway). Raise with clear message.
-            log('  WARNING: Cookies loaded but session invalid on upload page.')
-            log('  The cookies may be expired or missing auth tokens.')
-            log('  Re-run capture_cookies.bat locally to get fresh cookies.')
-            raise RuntimeError(
-                'Cookie session invalid. Re-capture cookies locally with capture_cookies.bat '
-                'and re-set the RUMBLE_COOKIES secret.'
-            )
         else:
-            log('  No valid session, logging in...')
+            if cookies_loaded:
+                log('  WARNING: Cookies loaded but session invalid on upload page.')
+                log('  Cookies are likely expired - falling back to credential login.')
+            else:
+                log('  No valid session, logging in...')
+
+            if not (RUMBLE_EMAIL and RUMBLE_PASSWORD):
+                raise RuntimeError(
+                    'Rumble session is invalid and there are no credentials to fall '
+                    'back on. Either re-capture cookies locally (capture_cookies.bat) '
+                    'and re-set the RUMBLE_COOKIES secret, or set RUMBLE_EMAIL + '
+                    'RUMBLE_PASSWORD so the workflow can log in by itself.'
+                )
+
             if not self._login():
-                raise RuntimeError('Login failed.')
+                raise RuntimeError(
+                    'Login failed (cookies were also expired{}). If Rumble shows a '
+                    'Cloudflare challenge, re-capture cookies locally with '
+                    'capture_cookies.bat and re-set the RUMBLE_COOKIES secret.'.format(
+                        '' if cookies_loaded else ' - no cookies were provided'
+                    )
+                )
+
             # Navigate back to upload page after login
             self.page.goto(UPLOAD_URL, wait_until='networkidle')
             time.sleep(2)
+
+            if not self._is_logged_in():
+                raise RuntimeError(
+                    'Login appeared to succeed but the upload page shows no session. '
+                    'Re-capture cookies locally with capture_cookies.bat and re-set '
+                    'the RUMBLE_COOKIES secret.'
+                )
 
         self._save_session()
 

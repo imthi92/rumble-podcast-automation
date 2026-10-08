@@ -97,11 +97,21 @@ jobs:
           RUMBLE_PASSWORD: ${{ secrets.RUMBLE_PASSWORD }}
           RUMBLE_COOKIES: ${{ secrets.RUMBLE_COOKIES }}
         run: |
-          if [ -n "$RUMBLE_COOKIES" ]; then
-            echo "RUMBLE_COOKIES secret found - will use cookie auth"
-          elif [ -z "$RUMBLE_EMAIL" ] || [ -z "$RUMBLE_PASSWORD" ]; then
-            echo "ERROR: Set RUMBLE_COOKIES secret (preferred) or RUMBLE_EMAIL + RUMBLE_PASSWORD"
+          # Presence booleans only - values are never echoed (Actions masks
+          # them anyway, but this keeps the log readable).
+          echo "RUMBLE_COOKIES present:   $([ -n "$RUMBLE_COOKIES" ] && echo yes || echo NO)"
+          echo "RUMBLE_EMAIL present:     $([ -n "$RUMBLE_EMAIL" ] && echo yes || echo NO)"
+          echo "RUMBLE_PASSWORD present:  $([ -n "$RUMBLE_PASSWORD" ] && echo yes || echo NO)"
+
+          if [ -z "$RUMBLE_COOKIES" ] && { [ -z "$RUMBLE_EMAIL" ] || [ -z "$RUMBLE_PASSWORD" ]; }; then
+            echo "::error title=Rumble credentials missing::Set RUMBLE_COOKIES (preferred, from capture_cookies.bat) or RUMBLE_EMAIL + RUMBLE_PASSWORD."
             exit 1
+          fi
+
+          if [ -n "$RUMBLE_COOKIES" ]; then
+            if ! printf '%s' "$RUMBLE_COOKIES" | python -c "import json,sys; d=json.load(sys.stdin); c=d if isinstance(d,list) else d.get('cookies',[]); assert isinstance(c,list) and c, 'cookie list empty'; print('cookie payload: JSON OK,', len(c), 'cookies')"; then
+              echo "::warning title=RUMBLE_COOKIES not valid JSON::Falling back to email/password login if configured."
+            fi
           fi
           echo "Secrets validated OK"
 
@@ -131,7 +141,10 @@ jobs:
             CMD+=(--thumbnail "$THUMB")
           fi
           
-          "${CMD[@]}"
+          if ! "${CMD[@]}"; then
+            echo "::error title=Rumble upload failed::See the log above. If the session was invalid: re-capture cookies locally with capture_cookies.bat and update RUMBLE_COOKIES (or set RUMBLE_EMAIL + RUMBLE_PASSWORD so the job can log in by itself)."
+            exit 1
+          fi
 
       - name: Upload artifacts
         if: always()
