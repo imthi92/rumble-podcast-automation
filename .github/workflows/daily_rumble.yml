@@ -28,7 +28,13 @@ jobs:
           ffmpeg -version | head -1
 
       - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
+        run: |
+          python -m playwright install --with-deps chromium
+          # Rumble's login sits behind Cloudflare Turnstile, which blocks
+          # Playwright's default headless mode. Run the login inside a real
+          # (headed) browser on a virtual display instead.
+          sudo apt-get install -y -qq xvfb
+          xvfb-run --help > /dev/null && echo "xvfb-run ready"
 
       - name: Validate scripts directory
         run: |
@@ -135,10 +141,21 @@ jobs:
           echo "Thumbnail: $THUMB"
           
           # Build upload command as array (safe for spaces/special chars)
-          CMD=(python rumble_upload.py --video "$VIDEO" --title "Cat Podcast Episode - $(date +%Y-%m-%d)")
+          ARGS=(python rumble_upload.py --video "$VIDEO" --title "Cat Podcast Episode - $(date +%Y-%m-%d)")
           
           if [ -f "$THUMB" ]; then
-            CMD+=(--thumbnail "$THUMB")
+            ARGS+=(--thumbnail "$THUMB")
+          fi
+
+          # Headed browser on a virtual display: only needed when the cookie
+          # session has expired and we must log in (Turnstile blocks headless).
+          # Falls back to a plain run if xvfb-run is unavailable.
+          if command -v xvfb-run > /dev/null 2>&1; then
+            CMD=(xvfb-run -a "${ARGS[@]}" --headed)
+            echo "Running with xvfb-run (headed browser) so Cloudflare login can complete"
+          else
+            CMD=("${ARGS[@]}")
+            echo "xvfb-run not available - running as-is (cookie auth only)"
           fi
           
           if ! "${CMD[@]}"; then
